@@ -45,9 +45,31 @@ namespace Radegast.Core.RLV
 
         public async Task AttachAsync(IReadOnlyList<AttachmentRequest> itemsToAttach, CancellationToken cancellationToken)
         {
-            foreach (var item in itemsToAttach)
+            // Consecutive items that share a replace flag go out as one AddToOutfit call.
+            // That creates the COF links in one request and rezs the objects in one packet.
+            // Awaiting each item here is what made an outfit appear one attachment at a time.
+            List<InventoryItem>? pending = null;
+            var pendingReplace = false;
+
+            async Task FlushPendingAsync()
             {
-                if (!instance.Client.Inventory.Store!.TryGetValue(new UUID(item.ItemId), out var foundItem))
+                if (pending == null || pending.Count == 0)
+                {
+                    pending = null;
+                    return;
+                }
+
+                var items = pending;
+                var replace = pendingReplace;
+                pending = null;
+                await instance.COF.AddToOutfitAsync(items, replace, cancellationToken).ConfigureAwait(false);
+            }
+
+            foreach (var request in itemsToAttach)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (!instance.Client.Inventory.Store!.TryGetValue(new UUID(request.ItemId), out var foundItem))
                 {
                     continue;
                 }
@@ -59,13 +81,46 @@ namespace Radegast.Core.RLV
 
                 if (inventoryItem.InventoryType == InventoryType.Wearable)
                 {
-                    await instance.COF.AddToOutfitAsync(inventoryItem, item.ReplaceExistingAttachments, cancellationToken);
+                    // AddToOutfit only replaces the first wearable in a list. Replacing one
+                    // at a time keeps the previous behavior, where each layer replaces its own type.
+                    if (request.ReplaceExistingAttachments)
+                    {
+                        await FlushPendingAsync().ConfigureAwait(false);
+                        await instance.COF.AddToOutfitAsync(inventoryItem, true, cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
                 }
                 else
                 {
-                    await instance.COF.AttachAsync(inventoryItem, (AttachmentPoint)item.AttachmentPoint, item.ReplaceExistingAttachments, cancellationToken);
+                    // Same restriction check the single-item attach path used to apply.
+                    if (!await instance.COF.CanAttachItemAsync(inventoryItem, cancellationToken).ConfigureAwait(false))
+                    {
+                        continue;
+                    }
+
+                    // AddToOutfit rezs an object at the point stored on the item. A point named
+                    // by the RLV command (a "(spine)" folder, for example) still has to go through
+                    // Attach so that point is the one in the packet.
+                    var point = (AttachmentPoint)request.AttachmentPoint;
+                    if (!(inventoryItem is InventoryObject) || point != AttachmentPoint.Default)
+                    {
+                        await FlushPendingAsync().ConfigureAwait(false);
+                        await instance.COF.AttachAsync(inventoryItem, point, request.ReplaceExistingAttachments, cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
                 }
+
+                if (pending != null && pendingReplace != request.ReplaceExistingAttachments)
+                {
+                    await FlushPendingAsync().ConfigureAwait(false);
+                }
+
+                pending ??= new List<InventoryItem>();
+                pendingReplace = request.ReplaceExistingAttachments;
+                pending.Add(inventoryItem);
             }
+
+            await FlushPendingAsync().ConfigureAwait(false);
         }
 
         public async Task DetachAsync(IReadOnlyList<Guid> itemIds, CancellationToken cancellationToken)
