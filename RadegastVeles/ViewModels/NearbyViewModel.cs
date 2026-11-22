@@ -572,6 +572,7 @@ public partial class NearbyViewModel : TabViewModelBase, IChatContext
     {
         Dispatcher.UIThread.Post(() =>
         {
+            ChatLine.TrimOldest(ChatLines);
             MaybeInsertDateSeparator(ChatLines, line);
             ChatLines.Add(line);
             LogChatLine(line);
@@ -1284,14 +1285,17 @@ public partial class NearbyViewModel : TabViewModelBase, IChatContext
         gridX /= 256;
         gridY /= 256;
 
-        var cached = MapTileCache.GetTile(gridX, gridY);
+        var server = MapTileCache.ServerFor(_instance);
+        if (server == null) { MinimapTile = null; return; }
+
+        var cached = MapTileCache.GetTile(server, gridX, gridY);
         if (cached != null)
         {
             MinimapTile = cached;
             return;
         }
 
-        MapTileCache.RequestTile(gridX, gridY, () => MinimapTile = MapTileCache.GetTile(gridX, gridY));
+        MapTileCache.RequestTile(server, gridX, gridY, () => MinimapTile = MapTileCache.GetTile(server, gridX, gridY));
     }
 
     #endregion
@@ -1359,6 +1363,19 @@ public record ChatLine(DateTime Timestamp, string From, string Text, ChatLineTyp
 
     public static ChatLine CreateDateSeparator(DateTime date) =>
         new(date, string.Empty, string.Empty, ChatLineType.DateSeparator);
+
+    /// <summary>
+    /// Most lines a chat or IM view keeps in memory. Older lines stay in the chat log file
+    /// when chat logging is on.
+    /// </summary>
+    public const int MaxLinesInMemory = 5000;
+
+    /// <summary>Drops the oldest lines so that one more can be appended within the limit.</summary>
+    public static void TrimOldest(ObservableCollection<ChatLine> lines)
+    {
+        while (lines.Count >= MaxLinesInMemory)
+            lines.RemoveAt(0);
+    }
 
     /// <summary>
     /// Returns a new list that is <paramref name="chunk"/> with date-change separator items

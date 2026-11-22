@@ -1,15 +1,14 @@
 #version 310 es
 precision highp float;
 
-// Final composite: combines the full-resolution HDR scene colour with the blurred bloom target,
-// applies a filmic tonemap curve, and writes the result into the REAL swapchain image -- this
-// pass (not the main scene pass) is now the true last thing that touches it. See
-// VkRenderPass.CreateTonemapOutputPass's own doc comment for why this pass, not the main pass,
-// owns that role after the HDR buffer was introduced.
+// Final composite: adds bloom and god rays to the full-resolution HDR scene colour, rolls off
+// highlights above kKnee (see highlightShoulder) and writes the swapchain image. On the HDR tiers
+// this is the last pass to touch it (see VkRenderPass.CreateTonemapOutputPass).
 
-layout(set = 0, binding = 0) uniform sampler2D uSceneColor; // full-res HDR (R16G16B16A16Sfloat)
+layout(set = 0, binding = 0) uniform sampler2D uSceneColor; // full-res HDR (VkViewportControl._hdrColorFormat)
 layout(set = 0, binding = 1) uniform sampler2D uBloomTex;   // half-res, already blurred
 layout(set = 0, binding = 2) uniform sampler2D uGodRayTex;  // half-res, already blurred/streaked
+layout(set = 0, binding = 3) uniform sampler2D uBloomWideTex; // quarter-res, blurred again
 
 layout(push_constant) uniform PerDraw
 {
@@ -29,6 +28,8 @@ layout(location = 0) out vec4 fragColor;
 // (the sun disc, water sparkle, the sky shader's cloud silver lining), not a global soft-focus
 // wash over the whole frame.
 const float kBloomIntensity = 0.55;
+// Share of that weight given to the wide (quarter-res) level; the rest goes to the tight one.
+const float kBloomWideShare = 0.5;
 
 // Tint for the god-ray contribution -- warm, matching the sun disc rather than a neutral white
 // streak. The mask (godray_mask.frag) outputs a luminance-only brightness value so the final
@@ -38,38 +39,46 @@ const float kBloomIntensity = 0.55;
 const vec3  kGodRayTint      = vec3(1.0, 0.92, 0.75);
 const float kGodRayIntensity = 0.9;
 
-// ACES filmic tonemap curve (Narkowicz 2015 fit) -- a cheap, well-behaved approximation of the
-// full ACES reference curve: rolls bright highlights off toward white with a smooth shoulder
-// instead of hard-clipping at 1.0 (which is what every UNORM-target frame before this pass
-// existed did -- the sun disc's own >1.0 core, for one, previously just clipped to a flat white
-// disc with a hard edge). Applied per-channel; input is expected roughly in the same "looks
-// right around 0-1, real content can run somewhat higher" range this engine's existing shaders
-// already target (see atmosphere.glsl's own atmSoftClip, a per-shader soft-knee doing local
-// compression for the same reason before this pass existed) -- not strict scene-linear
-// radiometric units, so this is a display-curve choice tuned by eye, not a colour-science claim.
-vec3 acesFilm(vec3 x)
+// Highlight shoulder -- NOT a full filmic curve. Every scene shader that writes the HDR buffer
+// (prim.frag, sky.frag, water.frag, particle.frag) already outputs DISPLAY-REFERRED colour:
+// prim.frag's PBR path runs its own ACES fit and both of its paths gamma-encode, sky/water run
+// atmSoftClip. Those are the same values VkGraphicsTier.Low writes straight to the swapchain. So
+// the only job left here is rolling off what a UNORM target would have hard-clipped (the sun
+// disc's >1.0 core, specular spikes, bloom/god-ray additions): identity below kKnee, a smooth
+// C1-continuous shoulder toward 1.0 above it. A full tonemap curve here would be a second one on
+// top of the scene shaders' own and would shift hue.
+const float kKnee = 0.8;
+
+vec3 highlightShoulder(vec3 c)
 {
-    const float a = 2.51;
-    const float b = 0.03;
-    const float c = 2.43;
-    const float d = 0.59;
-    const float e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+    vec3 over = max(c - vec3(kKnee), vec3(0.0));
+    return min(c, vec3(kKnee)) + (1.0 - kKnee) * (vec3(1.0) - exp(-over / (1.0 - kKnee)));
 }
 
 void main()
 {
-    vec3 hdr    = texture(uSceneColor, vTexCoord).rgb;
-    vec3 bloom  = texture(uBloomTex,   vTexCoord).rgb;
-    vec3 godRay = texture(uGodRayTex,  vTexCoord).rgb;
+    vec3 hdr   = texture(uSceneColor, vTexCoord).rgb;
+    vec3 bloom = mix(texture(uBloomTex, vTexCoord).rgb,
+                     texture(uBloomWideTex, vTexCoord).rgb, kBloomWideShare);
 
-    vec3 combined = hdr + bloom * kBloomIntensity
-                        + godRay * kGodRayTint * (kGodRayIntensity * uGodRayIntensity);
-    vec3 mapped   = acesFilm(combined);
+    vec3 combined = hdr + bloom * kBloomIntensity;
+
+    // Branch, not just a multiply by uGodRayIntensity: on a frame where the god-ray passes
+    // didn't run, uGodRayTex holds whatever it last held, and a float target can hold Inf/NaN
+    // (Inf * 0.0 = NaN, which then poisons that channel of the whole composite).
+    if (uGodRayIntensity > 0.0)
+    {
+        vec3 godRay = texture(uGodRayTex, vTexCoord).rgb;
+        combined += godRay * kGodRayTint * (kGodRayIntensity * uGodRayIntensity);
+    }
+
+    // The RGBA16F fallback for the HDR buffer (see VkViewportControl._hdrColorFormat) is signed,
+    // so negative values can reach this point; the shoulder assumes c >= 0.
+    vec3 mapped = highlightShoulder(max(combined, vec3(0.0)));
 
     // Dither: same reasoning as sky.frag's own dither at the very end of its main() -- a smooth
-    // filmic curve quantised to 8 bits still shows visible banding across a slow gradient (sky,
-    // water, a softly lit wall) without it.
+    // gradient quantised to 8 bits still shows visible banding (sky, water, a softly lit wall)
+    // without it.
     vec3 p3 = fract(vec3(gl_FragCoord.xy, gl_FragCoord.x + gl_FragCoord.y) * 0.1031);
     p3 += dot(p3, p3.yzx + 33.33);
     float dither = fract((p3.x + p3.y) * p3.z) - 0.5;

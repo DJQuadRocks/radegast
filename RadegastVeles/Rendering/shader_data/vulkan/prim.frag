@@ -554,7 +554,7 @@ void pbrLighting(vec3 albedo, float metallic, float roughness, float occlusion,
     // ACES filmic tonemap: compresses HDR highlights to [0,1] before gamma,
     // preventing hard clipping on smooth metallic specular spikes.
     col = acesFilmic(col);
-    col = pow(col, vec3(1.0 / 2.2));
+    col = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));
 
     result = vec4(col, alpha);
 }
@@ -620,7 +620,9 @@ void main()
 
         if (fullbright)
         {
-            vec3 glowCol = clamp(base.rgb * (1.0 + glow), 0.0, 1.0);
+            // Unclamped: a glowing face may exceed 1.0 so the bloom pass picks it up. UNORM targets
+        // (Low tier, water reflection) clamp on write.
+        vec3 glowCol = base.rgb * (1.0 + glow);
             fragColor = vec4(applyFog(glowCol), (alphaMode == 1) ? base.a : 1.0);
             return;
         }
@@ -716,7 +718,9 @@ void main()
     {
         // Glow adds extra brightness on top of the fully-lit base colour,
         // approximating the emission the face would contribute to a bloom pass.
-        vec3 glowCol = clamp(base.rgb * (1.0 + glow), 0.0, 1.0);
+        // Unclamped: a glowing face may exceed 1.0 so the bloom pass picks it up. UNORM targets
+        // (Low tier, water reflection) clamp on write.
+        vec3 glowCol = base.rgb * (1.0 + glow);
         fragColor = vec4(applyFog(glowCol), (alphaMode == 1) ? base.a : 1.0);
         return;
     }
@@ -866,7 +870,7 @@ void main()
     col += albedo * glow;
 
     // Convert back to sRGB for display.
-    col = pow(col, vec3(1.0 / 2.2));
+    col = pow(max(col, vec3(0.0)), vec3(1.0 / 2.2));
 
     // Emissive alpha mode (3): alpha drives additive emission rather than
     // transparency. The final fragment is fully opaque, mirroring the SL

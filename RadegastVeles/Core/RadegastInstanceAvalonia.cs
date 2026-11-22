@@ -35,11 +35,22 @@ namespace Radegast.Veles.Core;
 public sealed class RadegastInstanceAvalonia : RadegastInstance
 {
     private bool _initialCapsFetched;
-    private System.Threading.Timer? _renderInfoTimer;
     private System.Threading.Timer? _viewerStatsTimer;
     private DateTime _loginTime;
     private int _regionsVisited;
     public event EventHandler<NotificationChatEventArgs>? NotificationInChat;
+
+    private float _sceneFrameRate;
+
+    /// <summary>
+    /// Frames per second the 3D scene view is currently drawing, or 0 while it is closed.
+    /// Reported to the grid in viewer statistics.
+    /// </summary>
+    internal float SceneFrameRate
+    {
+        get => System.Threading.Volatile.Read(ref _sceneFrameRate);
+        set => System.Threading.Volatile.Write(ref _sceneFrameRate, value);
+    }
 
     /// <summary>Per-account credentials store; set by the app after successful login.</summary>
     internal CredentialManager? CredentialManager { get; set; }
@@ -67,6 +78,13 @@ public sealed class RadegastInstanceAvalonia : RadegastInstance
     /// <summary>Navigate to the World Map tab and locate the given agent.</summary>
     public void ShowOnMap(UUID agentId)
         => ShowOnMapRequested?.Invoke(this, agentId);
+
+    /// <summary>Raised to show a landmark on the world map: landmark name and asset id.</summary>
+    public event Action<string, UUID>? ShowLandmarkOnMapRequested;
+
+    /// <summary>Navigate to the World Map tab and center it on the given landmark.</summary>
+    public void ShowLandmarkOnMap(string name, UUID assetId)
+        => ShowLandmarkOnMapRequested?.Invoke(name, assetId);
 
     /// <summary>Open the group picker and call <paramref name="onSelected"/> with the chosen group.</summary>
     public void ShowGroupPicker(string title, Action<GroupPickerEntry> onSelected)
@@ -109,6 +127,9 @@ public sealed class RadegastInstanceAvalonia : RadegastInstance
 
     /// <summary>The active voice session manager (set by MainViewModel after login).</summary>
     public VoiceViewModel? Voice { get; internal set; }
+
+    /// <summary>This account's inventory cut/copy clipboard.</summary>
+    public InventoryClipboard ItemClipboard { get; } = new();
 
     /// <summary>The active media / audio manager (set by MainViewModel after login).</summary>
     public MediaViewModel? Media { get; internal set; }
@@ -153,7 +174,8 @@ public sealed class RadegastInstanceAvalonia : RadegastInstance
     /// <see cref="LowMemoryModeEnabled"/> is on.
     /// </summary>
     internal void ApplyCacheSettings(
-        int assetCacheMaxSizeMb, int skBitmapCacheCap, int textureBitmapCacheCapacity, int textureDiskCacheMaxFiles)
+        int assetCacheMaxSizeMb, int skBitmapCacheCap, int textureBitmapCacheCapacity, int textureDiskCacheMaxFiles,
+        int texturePixelCacheMaxMb)
     {
         bool low = LowMemoryModeEnabled;
         Client.Settings.AssetCache.MaxSize =
@@ -164,6 +186,8 @@ public sealed class RadegastInstanceAvalonia : RadegastInstance
             low ? LowMemoryModePreset.TextureBitmapCacheCapacity : textureBitmapCacheCapacity;
         TextureDiskCache.MaxCachedFiles =
             low ? LowMemoryModePreset.TextureDiskCacheMaxFiles : textureDiskCacheMaxFiles;
+        TextureDiskCache.MaxPixelCacheBytes =
+            (long)(low ? LowMemoryModePreset.TexturePixelCacheMaxMb : texturePixelCacheMaxMb) * 1024 * 1024;
         Rendering.PrimMeshBuilder.MeshCacheMaxVertices = low
             ? LowMemoryModePreset.MeshDecodeCacheMaxVertices
             : Rendering.PrimMeshBuilder.DefaultMeshCacheMaxVertices;
@@ -200,10 +224,13 @@ public sealed class RadegastInstanceAvalonia : RadegastInstance
         var skBitmapCacheCap = GlobalSettings["sk_bitmap_cache_cap"].Type != LibreMetaverse.StructuredData.OSDType.Unknown
             ? GlobalSettings["sk_bitmap_cache_cap"].AsInteger() : GridTextureHelper.RecommendSkBitmapCacheCap();
         var textureBitmapCacheCapacity = GlobalSettings["texture_bitmap_cache_capacity"].Type != LibreMetaverse.StructuredData.OSDType.Unknown
-            ? GlobalSettings["texture_bitmap_cache_capacity"].AsInteger() : 2500;
+            ? GlobalSettings["texture_bitmap_cache_capacity"].AsInteger() : MapTileCache.DefaultCacheCapacity;
         var textureDiskCacheMaxFiles = GlobalSettings["texture_disk_cache_max_files"].Type != LibreMetaverse.StructuredData.OSDType.Unknown
             ? GlobalSettings["texture_disk_cache_max_files"].AsInteger() : 8192;
-        ApplyCacheSettings(assetCacheMaxSizeMb, skBitmapCacheCap, textureBitmapCacheCapacity, textureDiskCacheMaxFiles);
+        var texturePixelCacheMaxMb = GlobalSettings["texture_pixel_cache_max_mb"].Type != LibreMetaverse.StructuredData.OSDType.Unknown
+            ? GlobalSettings["texture_pixel_cache_max_mb"].AsInteger() : TextureDiskCache.DefaultMaxPixelCacheMb;
+        ApplyCacheSettings(assetCacheMaxSizeMb, skBitmapCacheCap, textureBitmapCacheCapacity, textureDiskCacheMaxFiles,
+            texturePixelCacheMaxMb);
 
         client.Self.ScriptDialog += Self_ScriptDialog;
         client.Self.ScriptQuestion += Self_ScriptQuestion;
@@ -246,17 +273,10 @@ public sealed class RadegastInstanceAvalonia : RadegastInstance
         // AvatarRenderInfo is region-scoped — only act on the sim we are actually entering.
         if (e.Simulator != Client.Network.CurrentSim) return;
 
-        // GET: populate Client.Self.AvatarRenderInfo with the region's current complexity data.
+        // Populates Client.Self.AvatarRenderInfo with the region's current complexity data.
+        // Render weights are reported by the scene view (AvatarRenderInfoReporter) while it
+        // is open; with no scene view there is nothing measured to report.
         _ = Task.Run(() => Client.Self.GetAvatarRenderInfoAsync());
-
-        // POST: report local render weights on a 60-second interval, matching SL C++ behaviour.
-        // Veles has no renderer, so we report weight=0 / tooComplex=false for self only.
-        _renderInfoTimer?.Dispose();
-        _renderInfoTimer = new System.Threading.Timer(
-            _ => _ = Task.Run(() => Client.Self.PostAvatarRenderInfoAsync(0, false)),
-            null,
-            TimeSpan.FromSeconds(60),
-            TimeSpan.FromSeconds(60));
     }
 
     private async Task SendViewerStatsAsync()
@@ -271,7 +291,7 @@ public sealed class RadegastInstanceAvalonia : RadegastInstance
         var stats = new ViewerStatsMessage
         {
             SessionID         = Client.Self.SessionID,
-            AgentFPS          = 0f,
+            AgentFPS          = SceneFrameRate,
             AgentLanguage     = CultureInfo.CurrentCulture.Name,
             AgentMemoryUsed   = memKb,
             AgentPing         = sim.Stats.LastLag,
@@ -349,6 +369,9 @@ public sealed class RadegastInstanceAvalonia : RadegastInstance
 
             case InstantMessageDialog.GroupNotice:
                 if (Client.Self.MuteList.Values.Any(m => m.Type == MuteType.Group && m.ID == msg.FromAgentID)) return;
+                // "Receive group notices" is per membership. The simulator still delivers
+                // notices that were already queued, and sometimes live ones too.
+                if (!ShouldPresentGroupNotice(msg)) return;
                 NotificationReceived?.Invoke(this, NotificationViewModel.ForGroupNotice(Client, msg));
                 MediaManager.PlayUISound(UISounds.Alert);
                 break;
@@ -751,8 +774,6 @@ public sealed class RadegastInstanceAvalonia : RadegastInstance
     {
         NoticeArchive.Dispose();
         PluginManager?.Dispose();
-        _renderInfoTimer?.Dispose();
-        _renderInfoTimer = null;
         _viewerStatsTimer?.Dispose();
         _viewerStatsTimer = null;
         Client.Self.ScriptDialog -= Self_ScriptDialog;
@@ -763,6 +784,7 @@ public sealed class RadegastInstanceAvalonia : RadegastInstance
         NetCom.InstantMessageReceived -= NetCom_InstantMessageReceived;
         NetCom.AlertMessageReceived -= NetCom_AlertMessageReceived;
         Client.Friends.CallingCardOffered -= Friends_CallingCardOffered;
+        Client.Groups.GroupNamesReply -= Groups_GroupNamesReply;
         ChatLog.Dispose();
         base.CleanUp();
     }

@@ -20,9 +20,9 @@
 	<RuntimeIdentifier Condition="'$(Platform)'=='ARM64'">win-arm64</RuntimeIdentifier>
 	<SelfContained>false</SelfContained>
 	<AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
-	<Version>2.54.0</Version>
-	<AssemblyVersion>2.54.0.0</AssemblyVersion>
-	<FileVersion>2.54.0.0</FileVersion>
+	<Version>2.55.0</Version>
+	<AssemblyVersion>2.55.0.0</AssemblyVersion>
+	<FileVersion>2.55.0.0</FileVersion>
 	</PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|x86' ">
     <DebugType>full</DebugType>
@@ -44,17 +44,17 @@
     <StartupObject>Radegast.MainProgram</StartupObject>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="BugSplatDotNetStandard" Version="4.3.0" />
+    <PackageReference Include="BugSplatDotNetStandard" Version="5.0.0" />
     <PackageReference Include="C5" Version="3.0.0" />
     <PackageReference Include="CommandLineParser" Version="2.9.1" />
-    <PackageReference Include="Microsoft.Windows.Compatibility" Version="10.0.10" />
+    <PackageReference Include="Microsoft.Windows.Compatibility" Version="11.0.0" />
     <PackageReference Include="NetSparkleUpdater.UI.WinForms.NetFramework" Version="3.1.0" />
     <PackageReference Include="OpenTK" Version="3.3.3" />
     <Reference Include="System.Net.Http" />
     <PackageReference Include="OpenTK.GLControl" Version="3.3.3" />
-    <PackageReference Include="SkiaSharp.Views.WindowsForms" Version="4.152.0" />
+    <PackageReference Include="SkiaSharp.Views.WindowsForms" Version="4.156.1" />
     <PackageReference Include="System.Console" Version="4.3.1" />
-    <PackageReference Include="System.Resources.Extensions" Version="10.0.10" />
+    <PackageReference Include="System.Resources.Extensions" Version="11.0.0" />
     <PackageReference Include="System.Resources.ResourceManager" Version="4.3.0" />
     <PackageReference Include="System.Runtime" Version="4.3.1" />
     <PackageReference Include="System.Runtime.Extensions" Version="4.3.1" />

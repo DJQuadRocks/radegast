@@ -28,14 +28,14 @@ using Vector3 = System.Numerics.Vector3;
 namespace Radegast.Veles.Rendering;
 
 /// <summary>
-/// Drives every scene-viewer <see cref="SceneAvatarAnimator"/> from one shared ~30 Hz timer.
+/// Drives every scene-viewer <see cref="SceneAvatarAnimator"/> from one shared loop that runs once per rendered frame.
 /// Mirrors <see cref="FlexiSceneScheduler"/>: a busy region can have dozens of avatars, and
 /// one timer/task per avatar is unnecessary overhead that scales with avatar count for no
 /// benefit.
 /// <para>
 /// Also applies the same distance-based tick throttling as <see cref="FlexiSceneScheduler"/>
 /// -- avatars far from the camera get their bone-hierarchy world matrices recomputed at a
-/// fraction of the base rate (see <see cref="TickDivisor"/>) instead of paying full 30 Hz
+/// fraction of the base rate (see <see cref="TickDivisor"/>) instead of paying full-rate
 /// skeleton-walk cost for something a few pixels wide or off to the side. Uses the same
 /// 16 m / 32 m breakpoints as <see cref="FlexiSceneScheduler.TickDivisor"/> and
 /// <c>SceneAvatarStreamer.AvatarLodForDistance</c> so an avatar's mesh LOD, skeletal update
@@ -47,7 +47,11 @@ namespace Radegast.Veles.Rendering;
 /// </summary>
 internal sealed class AvatarSceneScheduler : IDisposable
 {
-    private const float SimTickRate = 1f / 30f;
+    // Animators tick once per rendered frame, so a pose never repeats or skips a frame. This
+    // is the interval used while no frames are being rendered.
+    private const int IdleTickMs = 50;
+    private readonly FramePulse _pulse;
+    private const float MaxCatchUpSeconds = 1f;
 
     private readonly GridClient _client;
     // Animator → consecutive skipped ticks since its last real Tick() call.
@@ -61,7 +65,11 @@ internal sealed class AvatarSceneScheduler : IDisposable
     private CancellationTokenSource? _cts;
     private bool _disposed;
 
-    public AvatarSceneScheduler(GridClient client) => _client = client;
+    public AvatarSceneScheduler(GridClient client, ISceneViewport viewport)
+    {
+        _client = client;
+        _pulse  = new FramePulse(viewport);
+    }
 
     public void Register(SceneAvatarAnimator animator) => _registered[animator] = 0;
 
@@ -80,6 +88,7 @@ internal sealed class AvatarSceneScheduler : IDisposable
         _cts?.Cancel();
         _cts?.Dispose();
         _cts = null;
+        _pulse.Dispose();
         _registered.Clear();
     }
 
@@ -90,22 +99,22 @@ internal sealed class AvatarSceneScheduler : IDisposable
     // with those matters here, not just copy-paste convenience.
     private static int TickDivisor(float distance) => distance switch
     {
-        < 16f => 1,  // full 30 Hz
-        < 32f => 2,  // ~15 Hz
-        < 64f => 4,  // ~7.5 Hz
-        _     => 8,  // ~3.75 Hz -- still alive (no visible freeze/pop), close to free
+        < 16f => 1,  // 60 Hz
+        < 32f => 4,  // 15 Hz
+        < 64f => 8,  // 7.5 Hz
+        _     => 16, // 3.75 Hz
     };
 
     private async Task RunAsync(CancellationToken ct)
     {
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(SimTickRate));
         var sw   = Stopwatch.StartNew();
         float prev = 0f;
 
         try
         {
-            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            while (true)
             {
+                await _pulse.WaitAsync(IdleTickMs, ct).ConfigureAwait(false);
                 float now = (float)sw.Elapsed.TotalSeconds;
                 float dt  = Math.Min(now - prev, 0.1f);
                 prev = now;
@@ -140,9 +149,9 @@ internal sealed class AvatarSceneScheduler : IDisposable
                             // Catch-up dt: the avatar animation player advances by dt, so a
                             // throttled animator needs the elapsed time since its last real
                             // tick, not just this cycle's slice, or its animations would
-                            // visibly slow down rather than just update less often. Same
-                            // reasoning and clamp as FlexiSceneScheduler's own catch-up dt.
-                            animator.Tick(Math.Min(dt * skipped, 0.1f));
+                            // visibly slow down rather than just update less often. The bound
+                            // must stay above the longest throttled interval (16 ticks).
+                            animator.Tick(Math.Min(dt * skipped, MaxCatchUpSeconds));
                         }
                         catch (Exception ex)
                         {

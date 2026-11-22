@@ -332,15 +332,11 @@ public partial class VoiceViewModel : InstanceViewModelBase, IDisposable
     // ── Public API used by other ViewModels ───────────────────────────────
 
     /// <summary>
-    /// Called once after login. If <see cref="AutoConnect"/> is enabled and voice is
-    /// available, automatically joins parcel voice so the user does not have to press
-    /// "Join Voice" manually.
+    /// Called once after login. If <see cref="AutoConnect"/> is enabled, joins parcel voice
+    /// as soon as the region offers it.
     /// </summary>
-    internal async Task TryAutoConnectAsync()
-    {
-        if (AutoConnect && VoiceEnabled && IsAvailable && !IsConnected)
-            await Connect();
-    }
+    internal Task TryAutoConnectAsync()
+        => AutoConnect ? JoinWhenVoiceIsReadyAsync() : Task.CompletedTask;
 
     internal async Task JoinGroupVoiceAsync(UUID groupId)
     {
@@ -565,6 +561,57 @@ public partial class VoiceViewModel : InstanceViewModelBase, IDisposable
         StatusText = "Disconnected";
         IsConnecting = false;
         HasConnectionError = false;
+        _rejoinAfterLogin = false;
+    }
+
+    // ── Grid connection ───────────────────────────────────────────────────
+
+    private const string VoiceSignalingCapability = "VoiceSignalingRequest";
+    private const int VoiceCapabilityTimeoutMs = 30_000;
+
+    // Nearby voice was on when the grid connection dropped, so it is rejoined after the next login.
+    private bool _rejoinAfterLogin;
+
+    /// <summary>
+    /// Voice runs on its own connection and would otherwise keep the microphone live while the
+    /// viewer is disconnected from the grid.
+    /// </summary>
+    private void OnGridDisconnected(object? sender, DisconnectedEventArgs e)
+    {
+        if (_voice == null || (!IsConnected && !IsConnecting)) return;
+
+        bool nearbyVoiceWasOn = _voice.Connected || IsConnecting;
+        Disconnect();
+        _rejoinAfterLogin = nearbyVoiceWasOn;
+        StatusText = "Left voice: disconnected from the grid";
+    }
+
+    private void OnGridConnected(object? sender, EventArgs e)
+    {
+        bool rejoin = _rejoinAfterLogin;
+        _rejoinAfterLogin = false;
+        if (rejoin || AutoConnect)
+            _ = JoinWhenVoiceIsReadyAsync();
+    }
+
+    /// <summary>
+    /// Joins nearby voice once the region offers the voice capability, which arrives a moment
+    /// after login. Must be called on the UI thread.
+    /// </summary>
+    private async Task JoinWhenVoiceIsReadyAsync()
+    {
+        try
+        {
+            if (!await CapabilityWait.WaitForAsync(_instance.Client, VoiceSignalingCapability,
+                    VoiceCapabilityTimeoutMs, default))
+                return;
+            if (_voice == null || !VoiceEnabled || !IsAvailable || IsConnected || IsConnecting) return;
+            await Connect();
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn("Could not join voice automatically.", ex);
+        }
     }
 
     private void WireEvents()
@@ -591,6 +638,8 @@ public partial class VoiceViewModel : InstanceViewModelBase, IDisposable
         _voice.OnReprovisionFailed          += OnReprovisionFailed;
         _voice.AudioDevice.OnAudioSourceEncodedSample += OnEncodedSampleReceived;
         _instance.Names.NameUpdated += OnNamesUpdated;
+        _instance.NetCom.ClientDisconnected += OnGridDisconnected;
+        _instance.NetCom.ClientConnected    += OnGridConnected;
     }
 
     private void UnwireEvents()
@@ -617,6 +666,8 @@ public partial class VoiceViewModel : InstanceViewModelBase, IDisposable
         _voice.OnReprovisionFailed          -= OnReprovisionFailed;
         _voice.AudioDevice.OnAudioSourceEncodedSample -= OnEncodedSampleReceived;
         _instance.Names.NameUpdated -= OnNamesUpdated;
+        _instance.NetCom.ClientDisconnected -= OnGridDisconnected;
+        _instance.NetCom.ClientConnected    -= OnGridConnected;
     }
 
     // ── Event handlers ────────────────────────────────────────────────────

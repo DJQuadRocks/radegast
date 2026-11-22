@@ -110,6 +110,11 @@ internal sealed class SceneObjectStreamer : IDisposable
     // on object removal, mirroring _textureLodLevel's own cleanup sites.
     private readonly ConcurrentDictionary<ulong, int> _requestedTexLod = new();
 
+    // Per rendered object, the level of detail each of its mesh prims was built at, with the
+    // position (in the object's own region) and size that level was chosen from.
+    private readonly record struct MeshLodEntry(Vector3 Position, Vector3 Scale, DetailLevel Built);
+    private readonly ConcurrentDictionary<ulong, MeshLodEntry[]> _meshLod = new();
+
     // Reverse parent index: rootSceneKey → set of child scene keys.
     private readonly ConcurrentDictionary<ulong, ConcurrentDictionary<ulong, byte>> _childrenByParent = new();
 
@@ -152,7 +157,7 @@ internal sealed class SceneObjectStreamer : IDisposable
     private readonly Timer  _debounceTimer;
     // Fires every 10 s to upgrade textures on objects that the avatar walked closer to.
     private readonly Timer  _textureLodTimer;
-    // Fires every 10 s to catch root prims that are sitting in a tracked simulator's
+    // Polls (see ReconcilePollMs) to catch root prims that are sitting in a tracked simulator's
     // ObjectsPrimitives (current OR neighbor) but that this streamer never learned about --
     // see ReconcileUntrackedPrims's own doc comment for why that gap exists and what this
     // recovers. Self-healing regardless of the exact cause, and a diagnostic in its own right:
@@ -172,6 +177,20 @@ internal sealed class SceneObjectStreamer : IDisposable
     // sceneKeys ReconcileUntrackedPrims has already logged a recovery for -- logged once per key
     // (not once per sweep) so a persistently-failing recovered object doesn't spam every 10 s.
     private readonly ConcurrentDictionary<ulong, byte> _reconcileReported = new();
+
+    // Roots dropped only because they were beyond the stream radius. ReconcileUntrackedPrims
+    // re-admits them without its cooldown or warning once the avatar comes within range.
+    private readonly ConcurrentDictionary<ulong, byte> _outOfRange = new();
+
+    // The reconcile timer ticks every ReconcilePollMs; a sweep runs when the avatar has moved
+    // ReconcileMoveThreshold metres since the last one, or after ReconcileIntervalMs regardless.
+    private const int   ReconcilePollMs        = 1_000;
+    private const long  ReconcileIntervalMs    = 10_000;
+    private const float ReconcileMoveThreshold = 4f;
+    private long      _lastReconcileTick;
+    private OmVector3 _lastReconcileAvatarPos;
+    private int       _reconcileRunning;
+    private readonly Dictionary<ulong, long> _droppedPacketsLogged = new();
 
     private float _maxStreamRadius = 96f;
 
@@ -200,7 +219,7 @@ internal sealed class SceneObjectStreamer : IDisposable
         _textureLodTimer = new Timer(_ => CheckTextureLodUpgrades(), null,
             TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
         _reconcileTimer  = new Timer(_ => ReconcileUntrackedPrims(), null,
-            TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+            TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(ReconcilePollMs));
 
         _viewport.SceneObjectUploadFailed += OnSceneObjectUploadFailed;
     }
@@ -236,6 +255,7 @@ internal sealed class SceneObjectStreamer : IDisposable
         _lastBuildHadFlexi.TryRemove(sceneKey, out _);
         _textureLodLevel.TryRemove(sceneKey, out _);
         _requestedTexLod.TryRemove(sceneKey, out _);
+        _meshLod.TryRemove(sceneKey, out _);
         EnqueueDirty(sceneKey);
     }
 
@@ -292,7 +312,7 @@ internal sealed class SceneObjectStreamer : IDisposable
             // cancel/starve a linkset's build purely on placeholder data. Falling through to
             // EnqueueDirty below is safe either way: the real radius gate re-runs once the root
             // is known, in ProcessDirty/EnqueueBuild's own position lookups.
-            CancelAndRemove(sceneKey);
+            DropOutOfRange(sceneKey);
             return;
         }
 
@@ -323,7 +343,7 @@ internal sealed class SceneObjectStreamer : IDisposable
         // comment.
         if (trustworthyPos && !IsWithinRadius(worldPos, avatarPos, _maxStreamRadius))
         {
-            CancelAndRemove(sceneKey);
+            DropOutOfRange(sceneKey);
             return;
         }
 
@@ -446,6 +466,7 @@ internal sealed class SceneObjectStreamer : IDisposable
         var currentSim = _client.Network.CurrentSim;
         var sceneKey   = MakeSceneKey(sim, localId, currentSim);
         CancelAndRemove(sceneKey);
+        _outOfRange.TryRemove(sceneKey, out _);
 
         if (sim.ObjectsPrimitives.TryGetValue(localId, out var prim) && prim.ParentID != 0)
         {
@@ -491,22 +512,32 @@ internal sealed class SceneObjectStreamer : IDisposable
     /// Immediately removes any rendered objects that now lie outside the current
     /// <see cref="DrawDistance"/>.
     /// </summary>
-    public void CullBeyondDrawDistance()
+    public void CullBeyondDrawDistance() => CullBeyond(_maxStreamRadius);
+
+    // Objects are admitted within the stream radius and, as the avatar moves away, removed once
+    // they are this much farther out. The gap keeps an object near the edge from being rebuilt
+    // and removed repeatedly.
+    private const float CullHysteresis = 1.25f;
+
+    private void CullBeyond(float radius)
     {
         if (_disposed) return;
         var avatarPos  = _client.Self.SimPosition;
         var currentSim = _client.Network.CurrentSim;
         if (currentSim == null) return;
+        // The agent's position reads as zero until its first update; culling against that
+        // would remove the whole scene.
+        if (avatarPos == OmVector3.Zero) return;
 
-        foreach (var sceneKey in _rendered.Keys)
+        foreach (var (sceneKey, _) in _rendered)
         {
             var sim         = SimForSceneKey(sceneKey) ?? currentSim;
             var rootLocalId = LocalIdForSceneKey(sceneKey);
             var objs        = sim.ObjectsPrimitives;
             if (objs == null || !objs.TryGetValue(rootLocalId, out var root)) continue;
             var worldPos = ApplyRegionOffset(new Vector3(root.Position.X, root.Position.Y, root.Position.Z), sim, currentSim);
-            if (!IsWithinRadius(worldPos, avatarPos, _maxStreamRadius))
-                CancelAndRemove(sceneKey);
+            if (!IsWithinRadius(worldPos, avatarPos, radius))
+                DropOutOfRange(sceneKey);
         }
     }
 
@@ -524,6 +555,11 @@ internal sealed class SceneObjectStreamer : IDisposable
         {
             if (SimForSceneKey(sceneKey) == sim)
                 CancelAndRemove(sceneKey);
+        }
+        foreach (var sceneKey in _outOfRange.Keys)
+        {
+            if (SimForSceneKey(sceneKey) == sim)
+                _outOfRange.TryRemove(sceneKey, out _);
         }
     }
 
@@ -562,10 +598,13 @@ internal sealed class SceneObjectStreamer : IDisposable
         _rendered.Clear();
         _textureLodLevel.Clear();
         _requestedTexLod.Clear();
+        _meshLod.Clear();
         _childrenByParent.Clear();
         _neighborIndex.Clear();
         _reconcileAttempts.Clear();
         _reconcileReported.Clear();
+        _outOfRange.Clear();
+        _meshRetryAttempts.Clear();
         _debounceTimer.Change(Timeout.Infinite, Timeout.Infinite);
         _fetchScheduler.Clear();
 
@@ -650,9 +689,42 @@ internal sealed class SceneObjectStreamer : IDisposable
         _rendered.TryRemove(sceneKey, out _);
         _textureLodLevel.TryRemove(sceneKey, out _);
         _requestedTexLod.TryRemove(sceneKey, out _);
+        _meshLod.TryRemove(sceneKey, out _);
         _lastRebuiltPose.TryRemove(sceneKey, out _);
         _lastBuildHadFlexi.TryRemove(sceneKey, out _);
+        _meshRetryAttempts.TryRemove(sceneKey, out _);
         _viewport.RemoveSceneObject(sceneKey);
+    }
+
+    // A mesh fetch can fail for reasons that pass: the region's capabilities are briefly
+    // unavailable around a region crossing, or the asset server times out. A linkset built with
+    // prims missing for that reason is rebuilt after a delay, a limited number of times.
+    private readonly ConcurrentDictionary<ulong, int> _meshRetryAttempts = new();
+    private const int MaxMeshRetries     = 3;
+    private const int MeshRetryDelayMs   = 10_000;
+
+    private void ScheduleMeshRetry(ulong sceneKey, bool meshesUnavailable)
+    {
+        if (!meshesUnavailable)
+        {
+            _meshRetryAttempts.TryRemove(sceneKey, out _);
+            return;
+        }
+
+        int attempt = _meshRetryAttempts.AddOrUpdate(sceneKey, 1, (_, n) => n + 1);
+        if (attempt > MaxMeshRetries) return;
+
+        _ = Task.Delay(MeshRetryDelayMs * attempt).ContinueWith(_ =>
+        {
+            if (!_disposed && _rendered.ContainsKey(sceneKey) && _meshRetryAttempts.ContainsKey(sceneKey))
+                EnqueueDirty(sceneKey);
+        }, TaskScheduler.Default);
+    }
+
+    private void DropOutOfRange(ulong sceneKey)
+    {
+        CancelAndRemove(sceneKey);
+        _outOfRange[sceneKey] = 0;
     }
 
     private const int MaxBuildsPerTick = 20;
@@ -856,7 +928,8 @@ internal sealed class SceneObjectStreamer : IDisposable
                 // prefetch for them is merely missed — the build path downloads on miss).
                 var prims = CollectLinkset(sim, LocalIdForSceneKey(sceneKey));
                 if (prims is { Count: > 0 })
-                    await _builder.PrefetchLinksetAssetsAsync(prims, token).ConfigureAwait(false);
+                    await _builder.PrefetchLinksetAssetsAsync(prims, token,
+                        LocalIdForSceneKey(sceneKey), LodViewPosition(sim)).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -920,7 +993,10 @@ internal sealed class SceneObjectStreamer : IDisposable
             float dist    = Vector3.Distance(worldPos, avatarWorldPos);
             var   lod     = LodForDistance(dist);
             int   texLod  = TextureLodLevelForDistance(dist);
+            var   lodViewPos = LodViewPosition(sim);
+            var   meshLods   = CollectMeshLods(prims, rootPrimForLod, lodViewPos);
 
+            int meshesUnavailable = 0;
             var submission = await _builder.BuildAsync(
                 prims, rootLocalId,
                 label:                 $"prim:{rootLocalId}",
@@ -928,6 +1004,8 @@ internal sealed class SceneObjectStreamer : IDisposable
                 ct:                    token,
                 detailLevel:           lod,
                 textureResolutionLevel: texLod,
+                onMeshUnavailable:     () => Interlocked.Increment(ref meshesUnavailable),
+                lodViewPosition:       lodViewPos,
                 texturePatch: new Progress<SceneTexturePatch>(patch =>
                 {
                     if (token.IsCancellationRequested)
@@ -1007,6 +1085,9 @@ internal sealed class SceneObjectStreamer : IDisposable
 
             _viewport.SubmitSceneObject(sceneKey, submission);
             _rendered[sceneKey] = 0;
+            if (meshLods != null) _meshLod[sceneKey] = meshLods;
+            else _meshLod.TryRemove(sceneKey, out _);
+            ScheduleMeshRetry(sceneKey, Volatile.Read(ref meshesUnavailable) > 0);
             // Seeds the epsilon-gate baseline here too (not just for later rebuilds) so the very
             // first terse update after initial OnObjectUpdate doesn't immediately re-trigger a
             // redundant rebuild for a stationary object -- see OnTerseObjectUpdate's comment.
@@ -1050,6 +1131,75 @@ internal sealed class SceneObjectStreamer : IDisposable
             // for this key start a fresh attempt instead of deferring forever. See
             // MarkAttemptCompleted's own comment for why this is reference-equality-guarded.
             MarkAttemptCompleted(sceneKey, attempt);
+        }
+    }
+
+    // The viewer's position in `sim`'s own coordinates, or null while it is unknown.
+    private Vector3? LodViewPosition(Simulator sim)
+    {
+        var avatarPos = _client.Self.SimPosition;
+        if (avatarPos == OmVector3.Zero) return null;
+        var off = RegionOffset(sim, _client.Network.CurrentSim);
+        return new Vector3(avatarPos.X - off.X, avatarPos.Y - off.Y, avatarPos.Z);
+    }
+
+    private static MeshLodEntry[]? CollectMeshLods(List<Primitive> prims, Primitive root, Vector3? viewPos)
+    {
+        List<MeshLodEntry>? entries = null;
+        var rootPos = new Vector3(root.Position.X, root.Position.Y, root.Position.Z);
+        var rootRot = new Quaternion(root.Rotation.X, root.Rotation.Y, root.Rotation.Z, root.Rotation.W);
+        foreach (var prim in prims)
+        {
+            if (prim.Sculpt is not { Type: SculptType.Mesh } sculpt || sculpt.SculptTexture == UUID.Zero) continue;
+            var pos = rootPos;
+            if (prim.LocalID != root.LocalID)
+                pos += Vector3.Transform(new Vector3(prim.Position.X, prim.Position.Y, prim.Position.Z), rootRot);
+            var scale = new Vector3(prim.Scale.X, prim.Scale.Y, prim.Scale.Z);
+            var built = viewPos is { } v
+                ? PrimMeshBuilder.MeshLodFor(scale, Vector3.Distance(pos, v))
+                : DetailLevel.Highest;
+            (entries ??= new List<MeshLodEntry>()).Add(new MeshLodEntry(pos, scale, built));
+        }
+        return entries?.ToArray();
+    }
+
+    private const int   MeshLodUpgradesPerSweep   = 6;
+    private const int   MeshLodDowngradesPerSweep = 2;
+    // An object drops to a coarser level only once it would still pick that level from this
+    // fraction of its distance, so one standing near a threshold is not rebuilt back and forth.
+    private const float MeshLodDowngradeMargin    = 0.8f;
+
+    // Rebuilds objects whose mesh prims now call for a different level of detail than they
+    // were built at.
+    private void CheckMeshLodChanges()
+    {
+        if (_disposed) return;
+        int upgrades = 0, downgrades = 0;
+        foreach (var (sceneKey, entries) in _meshLod)
+        {
+            if (upgrades >= MeshLodUpgradesPerSweep && downgrades >= MeshLodDowngradesPerSweep) break;
+            if (!_rendered.ContainsKey(sceneKey) || _inflight.ContainsKey(sceneKey)) continue;
+            var sim = SimForSceneKey(sceneKey);
+            if (sim == null || LodViewPosition(sim) is not { } viewPos) continue;
+
+            bool upgrade = false, downgrade = false;
+            foreach (var e in entries)
+            {
+                float dist = Vector3.Distance(e.Position, viewPos);
+                if (PrimMeshBuilder.MeshLodFor(e.Scale, dist) > e.Built) { upgrade = true; break; }
+                if (PrimMeshBuilder.MeshLodFor(e.Scale, dist * MeshLodDowngradeMargin) < e.Built) downgrade = true;
+            }
+
+            if (upgrade && upgrades < MeshLodUpgradesPerSweep)
+            {
+                upgrades++;
+                EnqueueDirty(sceneKey);
+            }
+            else if (!upgrade && downgrade && downgrades < MeshLodDowngradesPerSweep)
+            {
+                downgrades++;
+                EnqueueDirty(sceneKey);
+            }
         }
     }
 
@@ -1154,12 +1304,32 @@ internal sealed class SceneObjectStreamer : IDisposable
         var currentSim = _client.Network.CurrentSim;
         if (currentSim == null) return;
         var avatarPos = _client.Self.SimPosition;
+        var now = Environment.TickCount64;
 
+        if (now - _lastReconcileTick < ReconcileIntervalMs &&
+            OmVector3.Distance(avatarPos, _lastReconcileAvatarPos) < ReconcileMoveThreshold)
+            return;
+        if (Interlocked.Exchange(ref _reconcileRunning, 1) != 0) return;
+        try
+        {
+            _lastReconcileTick      = now;
+            _lastReconcileAvatarPos = avatarPos;
+            ReconcileSweep(currentSim, avatarPos, now);
+            // Frees the geometry and textures of objects the avatar has left behind.
+            CullBeyond(_maxStreamRadius * CullHysteresis);
+            CheckMeshLodChanges();
+        }
+        finally
+        {
+            Volatile.Write(ref _reconcileRunning, 0);
+        }
+    }
+
+    private void ReconcileSweep(Simulator currentSim, OmVector3 avatarPos, long now)
+    {
         Simulator[] sims;
         lock (_client.Network.Simulators)
             sims = _client.Network.Simulators.ToArray();
-
-        var now = Environment.TickCount64;
 
         foreach (var sim in sims)
         {
@@ -1176,19 +1346,24 @@ internal sealed class SceneObjectStreamer : IDisposable
             // UDPBase.ReceiveLoopAsync's bounded-channel drop-write) -- the one place packet loss
             // for this connection would show up, since nothing else surfaces the counter.
             var dropped = sim.Stats.GetDroppedPackets();
-            if (dropped > 0)
+            _droppedPacketsLogged.TryGetValue(sim.Handle, out var loggedDropped);
+            if (dropped > 0 && dropped != loggedDropped)
+            {
+                _droppedPacketsLogged[sim.Handle] = dropped;
                 Logger.Log(
                     $"SceneObjectStreamer: sim {sim.Name} has dropped {dropped} inbound UDP packets this session",
                     LogLevel.Warning);
+            }
 
             var objs = sim.ObjectsPrimitives;
             if (objs == null) continue;
 
-            foreach (var root in objs.Values)
+            // Enumerated directly: .Values would lock the whole dictionary and copy it.
+            foreach (var (_, root) in objs)
             {
                 if (root.ParentID != 0) continue; // roots only -- CollectLinkset pulls children in
 
-                // A root whose position has never been filled in (still the zero placeholder) has
+                // A root that is still a placeholder (see IsPlaceholder) has
                 // reached ObjectsPrimitives without a full update -- possible if
                 // ObjectUpdateCachedHandler's CRC check decided a cached copy didn't need
                 // re-requesting, or if the root arrived via a reference from one of its own
@@ -1200,7 +1375,7 @@ internal sealed class SceneObjectStreamer : IDisposable
                 // so no further special-casing is needed once that lands. Reuses
                 // _reconcileAttempts as the same 60 s per-key cooldown so a still-stuck prim isn't
                 // re-requested every single 10 s sweep.
-                if (root.Position == OmVector3.Zero)
+                if (IsPlaceholder(root))
                 {
                     var zeroKey = MakeSceneKey(sim, root.LocalID, currentSim);
                     if (_reconcileAttempts.TryGetValue(zeroKey, out var lastZeroAttempt) &&
@@ -1211,7 +1386,7 @@ internal sealed class SceneObjectStreamer : IDisposable
                     if (_reconcileReported.TryAdd(zeroKey, 0))
                         Logger.Log(
                             $"SceneObjectStreamer: reconcile sweep found root prim {root.LocalID} " +
-                            $"in sim {sim.Name} with Position==Zero (never fully updated); re-requesting",
+                            $"in sim {sim.Name} that has never had a full update; re-requesting",
                             LogLevel.Warning);
                     _client.Objects.RequestObject(sim, root.LocalID);
                     continue;
@@ -1224,13 +1399,22 @@ internal sealed class SceneObjectStreamer : IDisposable
                 if (_dirty.ContainsKey(sceneKey)) continue;
                 if (_inflight.TryGetValue(sceneKey, out var attempt) && !attempt.Completed) continue;
 
-                if (_reconcileAttempts.TryGetValue(sceneKey, out var lastAttempt) &&
+                bool cameIntoRange = _outOfRange.ContainsKey(sceneKey);
+                if (!cameIntoRange &&
+                    _reconcileAttempts.TryGetValue(sceneKey, out var lastAttempt) &&
                     now - lastAttempt < ReconcileRetryCooldownMs)
                     continue;
 
                 var worldPos = ApplyRegionOffset(
                     new Vector3(root.Position.X, root.Position.Y, root.Position.Z), sim, currentSim);
                 if (!IsWithinRadius(worldPos, avatarPos, _maxStreamRadius)) continue;
+
+                if (cameIntoRange)
+                {
+                    _outOfRange.TryRemove(sceneKey, out _);
+                    EnqueueDirty(sceneKey);
+                    continue;
+                }
 
                 _reconcileAttempts[sceneKey] = now;
                 if (_reconcileReported.TryAdd(sceneKey, 0))
@@ -1271,6 +1455,14 @@ internal sealed class SceneObjectStreamer : IDisposable
         return result;
     }
 
+    /// <summary>
+    /// True for a prim the library created from a reference (a child's ParentID, a cached-object
+    /// CRC) and has not yet decoded an ObjectUpdate for. Both update handlers set the PCode, so
+    /// <see cref="PCode.None"/> identifies it. Its Position is the zero default, which cannot be
+    /// used as the test because a real prim can sit at the region origin.
+    /// </summary>
+    private static bool IsPlaceholder(Primitive prim) => prim.PrimData.PCode == PCode.None;
+
     private static bool IsWithinRadius(Vector3 primPos, OmVector3 avatarPos, float radius)
     {
         if (primPos == Vector3.Zero) return false;
@@ -1288,8 +1480,8 @@ internal sealed class SceneObjectStreamer : IDisposable
     /// whether that position is actually the root's (as opposed to the fallback below).
     /// <para>
     /// The fallback returns <paramref name="prim"/>'s own <c>Position</c> when the root hasn't
-    /// arrived in <c>sim.ObjectsPrimitives</c> yet (or reports <see cref="OmVector3.Zero"/>,
-    /// which the sim uses as a not-yet-known placeholder). For a CHILD prim that value is a
+    /// arrived in <c>sim.ObjectsPrimitives</c> yet (or is still a placeholder, see
+    /// <see cref="IsPlaceholder"/>). For a CHILD prim that value is a
     /// parent-relative offset, not a world position -- often just a few metres from the
     /// origin. Callers that gate culling on this must not treat that as "confirmed far away":
     /// doing so is what let an ordinary root-arrives-after-children race incorrectly cancel a
@@ -1306,7 +1498,7 @@ internal sealed class SceneObjectStreamer : IDisposable
         }
 
         var objs = sim.ObjectsPrimitives;
-        if (objs != null && objs.TryGetValue(rootId, out var root) && root.Position != OmVector3.Zero)
+        if (objs != null && objs.TryGetValue(rootId, out var root) && !IsPlaceholder(root))
         {
             trustworthy = true;
             return new Vector3(root.Position.X, root.Position.Y, root.Position.Z);

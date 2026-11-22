@@ -46,6 +46,10 @@ public sealed class ChatLogger : IDisposable
     private readonly Thread _worker;
     private volatile bool _disposed;
 
+    // Message lines this instance has appended to each log file. They sit at the end of
+    // the file and are already on screen as live messages, so history reads skip past them.
+    private readonly ConcurrentDictionary<string, int> _linesWrittenThisSession = new();
+
     /// <summary>
     /// When set, overrides the default base directory (%APPDATA%\RadegastVeles).
     /// Changes take effect on the next call to <see cref="Log"/>.
@@ -97,8 +101,9 @@ public sealed class ChatLogger : IDisposable
     }
 
     /// <summary>
-    /// Reads up to <paramref name="take"/> history lines from the log file,
-    /// skipping the last <paramref name="skip"/> lines (already loaded).
+    /// Reads up to <paramref name="take"/> history lines from the log file, counting back
+    /// from where the file ended when this session started and skipping the last
+    /// <paramref name="skip"/> of those lines (already loaded).
     /// Returns them in chronological order (oldest first) as history <see cref="ChatLine"/> objects.
     /// </summary>
     public IReadOnlyList<ChatLine> ReadHistoryChunk(
@@ -115,25 +120,34 @@ public sealed class ChatLogger : IDisposable
         try { allLines = File.ReadAllLines(path, System.Text.Encoding.UTF8); }
         catch { return result; }
 
-        // Work from the end: skip the last `skip` non-empty lines, then take `take`
+        skip += _linesWrittenThisSession.GetValueOrDefault(path);
+
+        // Work from the end: skip the last `skip` messages, then take `take`. A line that does
+        // not start a message continues the message above it, so those met on the way up are
+        // held until that message is reached. Only messages are counted, here and in the
+        // caller's offset.
         var collected = new List<(DateTime ts, string text)>();
+        var continuation = new List<string>();
         int skipped = 0;
         int lastConsumedIdx = -1;
         for (int i = allLines.Length - 1; i >= 0 && collected.Count < take; i--)
         {
-            var raw = allLines[i];
-            if (string.IsNullOrWhiteSpace(raw)) continue;
-            if (skipped < skip) { skipped++; continue; }
-
-            var m = LineRegex.Match(raw);
-            if (!m.Success) continue;
-
-            if (DateTime.TryParseExact(m.Groups[1].Value, "yyyy/MM/dd H:mm",
-                CultureInfo.InvariantCulture, DateTimeStyles.None, out var ts))
+            if (!TryParseLine(allLines[i], out var ts, out var text))
             {
-                collected.Add((ts, m.Groups[2].Value));
+                continuation.Add(allLines[i]);
+                continue;
+            }
+
+            if (skipped < skip)
+            {
+                skipped++;
+            }
+            else
+            {
+                collected.Add((ts, AppendContinuation(text, continuation)));
                 lastConsumedIdx = i;
             }
+            continuation.Clear();
         }
 
         // Check whether older valid lines exist before what we consumed
@@ -170,9 +184,49 @@ public sealed class ChatLogger : IDisposable
                     Directory.CreateDirectory(dir);
 
                 File.AppendAllText(path, line, System.Text.Encoding.UTF8);
+                int written = CountMessageLines(line);
+                _linesWrittenThisSession.AddOrUpdate(path, written, (_, n) => n + written);
             }
             catch { }
         }
+    }
+
+    private static bool TryParseLine(string raw, out DateTime timestamp, out string text)
+    {
+        timestamp = default;
+        text = string.Empty;
+        if (string.IsNullOrWhiteSpace(raw)) return false;
+        var m = LineRegex.Match(raw);
+        if (!m.Success) return false;
+        if (!DateTime.TryParseExact(m.Groups[1].Value, "yyyy/MM/dd H:mm",
+                CultureInfo.InvariantCulture, DateTimeStyles.None, out timestamp))
+            return false;
+        text = m.Groups[2].Value;
+        return true;
+    }
+
+    /// <summary>
+    /// Joins a message's first line with its later lines, given bottom-up as they were read.
+    /// Blank lines at the end are dropped.
+    /// </summary>
+    private static string AppendContinuation(string firstLine, List<string> linesBottomUp)
+    {
+        int first = 0;
+        while (first < linesBottomUp.Count && string.IsNullOrWhiteSpace(linesBottomUp[first])) first++;
+        if (first == linesBottomUp.Count) return firstLine;
+
+        var sb = new System.Text.StringBuilder(firstLine);
+        for (int i = linesBottomUp.Count - 1; i >= first; i--)
+            sb.Append('\n').Append(linesBottomUp[i]);
+        return sb.ToString();
+    }
+
+    private static int CountMessageLines(string text)
+    {
+        int count = 0;
+        foreach (var part in text.Split('\n'))
+            if (TryParseLine(part.TrimEnd('\r'), out _, out _)) count++;
+        return count;
     }
 
     public void Dispose()

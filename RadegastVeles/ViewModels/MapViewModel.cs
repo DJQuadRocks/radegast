@@ -37,6 +37,7 @@ public partial class MapViewModel : ClientAwareViewModelBase
     private bool Active => Client.Network.Connected;
 
     private readonly Dictionary<string, ulong> _regionHandles = new();
+    private readonly Dictionary<(uint X, uint Y), MapRegionEntry> _regionsByCell = new();
     private readonly HashSet<string> _requestedBlocks = new();
     private ulong _targetRegionHandle;
 #pragma warning disable CS0414
@@ -100,6 +101,12 @@ public partial class MapViewModel : ClientAwareViewModelBase
 
     // Map data exposed for the grid map control
     public ObservableCollection<MapRegionEntry> MapRegions { get; } = [];
+
+    /// <summary>Tile server of the grid this session is on, or null if it has none.</summary>
+    [ObservableProperty]
+    private string? _mapServerUrl;
+
+    private void UpdateMapServerUrl() => MapServerUrl = MapTileCache.ServerFor(_instance);
     public ObservableCollection<MapAvatarEntry> MapAvatars { get; } = [];
 
     /// <summary>
@@ -110,6 +117,7 @@ public partial class MapViewModel : ClientAwareViewModelBase
     public MapViewModel(RadegastInstanceAvalonia instance) : base(instance)
     {
         RegisterClientEvents(Client);
+        UpdateMapServerUrl();
 
         // Initial location and favorites
         if (Client.Network.CurrentSim != null)
@@ -243,6 +251,8 @@ public partial class MapViewModel : ClientAwareViewModelBase
     private void Refresh()
     {
         if (!Active || Client.Network.CurrentSim == null) return;
+        MapAvatars.Clear();
+        UpdateMapServerUrl();
         // Request map items (avatar locations) around current position
         Client.Grid.RequestMapItems(
             Client.Network.CurrentSim.Handle,
@@ -257,6 +267,7 @@ public partial class MapViewModel : ClientAwareViewModelBase
     public void RequestMapBlocksForRange(ushort minX, ushort minY, ushort maxX, ushort maxY)
     {
         if (!Active) return;
+        UpdateMapServerUrl();
         string block = $"{minX},{minY},{maxX},{maxY}";
         lock (_requestedBlocks)
         {
@@ -367,8 +378,7 @@ public partial class MapViewModel : ClientAwareViewModelBase
     public void SetMapTarget(uint regionGridX, uint regionGridY, uint localX, uint localY)
     {
         if (!Active) return;
-        var region = MapRegions.FirstOrDefault(r => r.GridX == regionGridX && r.GridY == regionGridY);
-        if (region != null)
+        if (_regionsByCell.TryGetValue((regionGridX, regionGridY), out var region))
         {
             RegionSearch = region.Name;
         }
@@ -380,8 +390,7 @@ public partial class MapViewModel : ClientAwareViewModelBase
     public void TeleportToPosition(uint regionGridX, uint regionGridY, uint localX, uint localY)
     {
         if (!Active) return;
-        var region = MapRegions.FirstOrDefault(r => r.GridX == regionGridX && r.GridY == regionGridY);
-        if (region == null)
+        if (!_regionsByCell.TryGetValue((regionGridX, regionGridY), out var region))
         {
             StatusText = "Unknown region — click a known region to teleport.";
             return;
@@ -399,31 +408,44 @@ public partial class MapViewModel : ClientAwareViewModelBase
 
     partial void OnSelectedFavoriteChanged(FavoriteLandmarkEntry? value)
     {
-        if (value == null || !Active) return;
+        if (value == null) return;
+        ShowLandmark(value.Name, value.AssetUUID);
+    }
+
+    /// <summary>
+    /// Centers the map on a landmark's location and makes it the teleport target.
+    /// Must be called on the UI thread.
+    /// </summary>
+    public void ShowLandmark(string name, UUID assetId)
+    {
+        if (!Active) return;
 
         // If already resolved, navigate immediately
         lock (_resolvedFavoritePositions)
         {
-            if (_resolvedFavoritePositions.TryGetValue(value.AssetUUID, out var pos))
+            if (_resolvedFavoritePositions.TryGetValue(assetId, out var pos))
             {
                 RegionSearch = pos.RegionName;
                 CoordX = pos.X;
                 CoordY = pos.Y;
                 CoordZ = pos.Z;
                 CanTeleport = true;
-                StatusText = $"Ready for {value.Name}";
+                StatusText = $"Ready for {name}";
                 GotoRegion(pos.RegionName, pos.X, pos.Y);
                 return;
             }
         }
 
         // Decode the landmark asset to find the region
-        StatusText = $"Locating {value.Name}...";
-        var capturedEntry = value;
+        StatusText = $"Locating {name}...";
         _ = Task.Run(async () =>
         {
-            var asset = await Client.Assets.RequestAssetAsync(value.AssetUUID, AssetType.Landmark, true);
-            if (asset is not AssetLandmark la || !la.Decode()) return;
+            var asset = await Client.Assets.RequestAssetAsync(assetId, AssetType.Landmark, true);
+            if (asset is not AssetLandmark la || !la.Decode())
+            {
+                Dispatcher.UIThread.Post(() => StatusText = $"Could not read the landmark {name}.");
+                return;
+            }
             var localPos = la.Position;
             lock (_navPendingByRegionId)
                 _navPendingByRegionId[la.RegionID] = ((int)localPos.X, (int)localPos.Y, (int)localPos.Z);
@@ -441,11 +463,14 @@ public partial class MapViewModel : ClientAwareViewModelBase
             var favFolderId = Client.Inventory.FindFolderForType(FolderType.Favorites);
             if (favFolderId == UUID.Zero) return;
 
-            List<InventoryBase> contents;
+            List<InventoryBase> contents = [];
             try
             {
-                contents = await Client.Inventory.RequestFolderContentsAsync(
-                    favFolderId, Client.Self.AgentID, false, true, InventorySortOrder.ByName);
+                if (await CapabilityWait.WaitForAsync(Client, "FetchInventoryDescendents2", 15_000))
+                {
+                    contents = await Client.Inventory.RequestFolderContentsAsync(
+                        favFolderId, Client.Self.AgentID, false, true, InventorySortOrder.ByName);
+                }
             }
             catch { return; }
 
@@ -680,14 +705,15 @@ public partial class MapViewModel : ClientAwareViewModelBase
             uint ry = (uint)e.Region.Y;
             if (e.Region.Access != SimAccess.NonExistent)
             {
-                var existing = MapRegions.FirstOrDefault(r => r.Handle == e.Region.RegionHandle);
-                if (existing == null)
+                if (!_regionsByCell.ContainsKey((rx, ry)))
                 {
-                    MapRegions.Add(new MapRegionEntry(
+                    var entry = new MapRegionEntry(
                         e.Region.RegionHandle,
                         e.Region.Name,
                         rx, ry,
-                        e.Region.Access));
+                        e.Region.Access);
+                    _regionsByCell[(rx, ry)] = entry;
+                    MapRegions.Add(entry);
                 }
             }
 
@@ -758,10 +784,12 @@ public partial class MapViewModel : ClientAwareViewModelBase
                     rx /= 256;
                     ry /= 256;
 
-                    MapAvatars.Add(new MapAvatarEntry(
+                    var entry = new MapAvatarEntry(
                         rx, ry,
                         loc.LocalX, loc.LocalY,
-                        loc.AvatarCount));
+                        loc.AvatarCount);
+                    if (!MapAvatars.Contains(entry))
+                        MapAvatars.Add(entry);
                 }
             }
         });
@@ -772,6 +800,7 @@ public partial class MapViewModel : ClientAwareViewModelBase
         Dispatcher.UIThread.Post(() =>
         {
             if (Client.Network.CurrentSim == null) return;
+            UpdateMapServerUrl();
             var simName = Client.Network.CurrentSim.Name;
             var pos = Client.Self.SimPosition;
             StatusText = $"Now in {simName}";

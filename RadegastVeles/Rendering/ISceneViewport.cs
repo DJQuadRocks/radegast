@@ -33,10 +33,7 @@ public interface ISceneViewport
     bool WaterReflectionsEnabled { get; set; }
     float WaterHeight { get; set; }
     bool AtmosphericsEnabled { get; set; }
-    /// <summary>Volumetric god rays (screen-space light shafts toward the sun). High-tier-only
-    /// and requires <see cref="SsaoEnabled"/> too (the mask stage reuses SSAO's G-buffer depth as
-    /// its occlusion source) -- see <c>VkViewportControl.RenderTonemapChain</c>'s own god-ray
-    /// stages for the full gate.</summary>
+    /// <summary>Volumetric god rays (screen-space light shafts toward the sun). High tier only.</summary>
     bool GodRaysEnabled { get; set; }
     bool FrustumCullingEnabled { get; set; }
     /// <summary>Hardware occlusion-query culling for scene objects fully hidden behind other
@@ -76,6 +73,17 @@ public interface ISceneViewport
     /// before the child viewport control is ever attached to the visual tree, so
     /// <c>InitializeAsync</c> cannot complete before the subscription exists.</summary>
     event Action? SceneReset;
+
+    /// <summary>Raised on the UI thread at the start of every rendered frame, before queued
+    /// transforms are applied and before the camera is read. Handlers update per-frame state
+    /// (interpolated transforms, camera follow) and call <see cref="RequestRender"/> to keep
+    /// frames coming while that state is still changing.</summary>
+    event Action? FrameUpdate;
+
+    /// <summary>Raised on the UI thread once per rendered frame, after that frame's skinning
+    /// and flexi work has been handed to the GPU. Work queued from here on is picked up by the
+    /// next frame.</summary>
+    event Action? DeformersDispatched;
     event Action<uint, int, FaceHitInfo>? FaceClicked;
     /// <summary>Plain right-click (select-for-menu, no touch) -- see
     /// <c>VkViewportControl.ObjectRightClicked</c>'s own doc comment.</summary>

@@ -14,10 +14,25 @@
     <ApplicationIcon>Assets\veles.ico</ApplicationIcon>
     <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <!-- Windows CI builds via `dotnet build -p:Platform=x86|x64|ARM64` with no RID of its own
+         (macOS/Linux publish an explicit -r <rid> on the command line, which always wins over
+         this regardless). Without a RuntimeIdentifier, PlatformTarget=x86/ARM64 has no matching
+         Microsoft.NETCore.App.Host.<rid> package to copy the apphost from, which fails the build
+         with MSB3030 ("Could not copy ... apphost.exe ... because it was not found") on any
+         Platform that doesn't match the build agent's own architecture (win-x64 on GitHub's
+         Windows runners). Mirrors Radegast.csproj's identical fix for the same class of bug. -->
+    <RuntimeIdentifier Condition="'$(Platform)'=='AnyCPU' or '$(Platform)'=='x64'">win-x64</RuntimeIdentifier>
+    <RuntimeIdentifier Condition="'$(Platform)'=='x86'">win-x86</RuntimeIdentifier>
+    <RuntimeIdentifier Condition="'$(Platform)'=='ARM64'">win-arm64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
   </PropertyGroup>
   <ItemGroup>
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
       <_Parameter1>BenchmarkSuite1</_Parameter1>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>RadegastVeles.Tests</_Parameter1>
     </AssemblyAttribute>
   </ItemGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
@@ -36,27 +51,27 @@
     <AssemblyMetadata Include="BugsplatDatabase" Value="$(BugsplatDatabase)" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Avalonia" Version="12.0.5" />
+    <PackageReference Include="Avalonia" Version="12.1.6" />
     <PackageReference Include="Avalonia.AvaloniaEdit" Version="12.0.0" />
-    <PackageReference Include="Avalonia.Desktop" Version="12.0.5" />
-    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.0.5" />
-    <PackageReference Include="Avalonia.Fonts.Inter" Version="12.0.5" />
-    <PackageReference Include="BugSplatDotNetStandard" Version="4.3.0" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.6" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.6" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.6" />
+    <PackageReference Include="BugSplatDotNetStandard" Version="5.0.0" />
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
     <PackageReference Include="NetSparkleUpdater.SparkleUpdater" Version="3.1.0" />
     <PackageReference Include="NetSparkleUpdater.UI.Avalonia" Version="3.1.0" />
     <!-- sherpa-onnx: managed API + platform-specific native runtimes -->
-    <PackageReference Include="org.k2fsa.sherpa.onnx" Version="1.13.3" />
-    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.win-x64" Version="1.13.3" />
-    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.win-arm64" Version="1.13.3" />
-    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.linux-x64" Version="1.13.3" />
-    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.linux-arm64" Version="1.13.3" />
-    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.osx-x64" Version="1.13.3" />
-    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.osx-arm64" Version="1.13.3" />
-    <PackageReference Include="CoreJ2K.Avalonia" Version="2.3.3.91" />
+    <PackageReference Include="org.k2fsa.sherpa.onnx" Version="2.0.1" />
+    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.win-x64" Version="2.0.1" />
+    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.win-arm64" Version="2.0.1" />
+    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.linux-x64" Version="2.0.1" />
+    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.linux-arm64" Version="2.0.1" />
+    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.osx-x64" Version="2.0.1" />
+    <PackageReference Include="org.k2fsa.sherpa.onnx.runtime.osx-arm64" Version="2.0.1" />
+    <PackageReference Include="CoreJ2K.Avalonia" Version="2.4.2.112" />
     <PackageReference Include="BCnEncoder.Net" Version="2.3.0" />
     <PackageReference Include="NVorbis" Version="0.10.5" />
-    <PackageReference Include="SharpCompress" Version="0.49.1" />
+    <PackageReference Include="SharpCompress" Version="1.0.0" />
     <PackageReference Include="Silk.NET.Vulkan" Version="2.23.0" />
     <PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" Version="2.23.0" />
     <PackageReference Include="Silk.NET.Vulkan.Extensions.EXT" Version="2.23.0" />
@@ -134,6 +149,12 @@
        libvulkan.dylib / libvulkan.1.dylib symlinks) match what the workflow step creates so the
        app finds Vulkan under either build mode. The version lives in moltenvk.version, the single
        source of truth also read by publish-veles-macos.yml. -->
+  <!-- macOS: the Dock icon for runs outside an app bundle (see MacDockIcon). The published
+       bundle carries its own copy in Contents/Resources. -->
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+    <None Include="Assets\veles.icns" Link="veles.icns" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Never" />
+  </ItemGroup>
+
   <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('OSX'))">
     <MoltenVKVersion Condition="'$(MoltenVKVersion)' == ''">$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)moltenvk.version').Trim())</MoltenVKVersion>
     <MoltenVKCacheDir>$(MSBuildThisFileDirectory)../.moltenvk/</MoltenVKCacheDir>

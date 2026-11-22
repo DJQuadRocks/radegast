@@ -144,7 +144,7 @@ public sealed class PrimRenderFace
     public          Matrix4x4 Transform
     {
         get => _transform;
-        set { _transform = value; _modelInv3Ready = false; }
+        set { _transform = value; _modelInv3Ready = false; _worldAabbReady = false; }
     }
 
     /// <summary>
@@ -376,6 +376,12 @@ public sealed class PrimRenderFace
     /// </summary>
     public void GetWorldAabb(out Vector3 min, out Vector3 max)
     {
+        if (_worldAabbReady)
+        {
+            min = _worldMin;
+            max = _worldMax;
+            return;
+        }
         EnsureLocalAabb();
         var t = Transform;
         // Transform 8 corners and reduce.
@@ -394,7 +400,14 @@ public sealed class PrimRenderFace
         }
         min = wMin;
         max = wMax;
+        _worldMin = wMin;
+        _worldMax = wMax;
+        _worldAabbReady = true;
     }
+
+    // World AABB for the current Transform; recomputed after Transform changes.
+    private Vector3 _worldMin, _worldMax;
+    private bool    _worldAabbReady;
 
     private void EnsureLocalAabb()
     {
@@ -610,6 +623,15 @@ public sealed class FlexiPrimInfo
     /// </summary>
     public Matrix4x4 ExternalTransform { get; set; } = Matrix4x4.Identity;
 
+    /// <summary>
+    /// When true the animator writes vertices in the owner's space (everything up to, but not
+    /// including, <see cref="ExternalTransform"/>) and the faces' own
+    /// <see cref="PrimRenderFace.Transform"/> carries the owner's world placement, so the prim
+    /// stays on its owner between simulation ticks. Set for avatar attachments. When false
+    /// the vertices are written in world space and the faces keep an identity transform.
+    /// </summary>
+    public bool OutputInOwnerSpace { get; init; }
+
     // ── Live attachment tracking (avatar attachments only) ────────────────────
 
     /// <summary>
@@ -784,11 +806,16 @@ public sealed record SceneTexturePatch(
     /// <summary>
     /// Asset UUID of the texture <see cref="Bitmap"/> was decoded from.
     /// <see cref="LibreMetaverse.UUID.Zero"/> (default) means "unknown" -- e.g. patches built
-    /// before this field existed, or synthetic bitmaps with no backing asset. Used by
-    /// <c>VkViewportControl.ApplySubmissionPatchIfReady</c> to key a
-    /// <c>TextureDiskCache.TryGetCompressedPixels</c> lookup for the BC3 compressed upload
-    /// path; a zero UUID simply skips that lookup and falls back to the uncompressed
-    /// <see cref="Bitmap"/> already carried here, so leaving this unset is always safe.
+    /// before this field existed, or synthetic bitmaps with no backing asset. Keys the
+    /// viewport's shared texture pool, so faces using the same asset share one GPU texture;
+    /// a zero UUID skips sharing, so leaving this unset is always safe.
     /// </summary>
     public LibreMetaverse.UUID TextureId { get; init; }
+
+    /// <summary>
+    /// The texture's block-compressed form from the disk cache, read by the builder on its own
+    /// thread so the render thread does no file I/O. Null when the cache has none, in which case
+    /// <see cref="Bitmap"/> is uploaded instead.
+    /// </summary>
+    internal Radegast.Veles.Core.CompressedKtx2? CompressedPixels { get; init; }
 }

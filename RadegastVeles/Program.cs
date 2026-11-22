@@ -22,10 +22,12 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using Avalonia;
 using BugSplatDotNetStandard;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using LibreMetaverse;
 using Radegast.Core;
 using Radegast.Veles.Core;
@@ -36,15 +38,104 @@ internal static class Program
 {
     internal static BugSplat? BugSplat { get; private set; }
 
+#if DEBUG
+    private const LogLevel DefaultLogLevel = LogLevel.Debug;
+#else
+    private const LogLevel DefaultLogLevel = LogLevel.Information;
+#endif
+
+    /// <summary>
+    /// The lowest level that is logged: Debug in debug builds, Information in release builds.
+    /// VELES_LOG_LEVEL overrides it with any <see cref="LogLevel"/> name, e.g. "Debug" or "Warning".
+    /// </summary>
+    private static LogLevel ResolveLogLevel()
+    {
+        var requested = Environment.GetEnvironmentVariable("VELES_LOG_LEVEL");
+        return Enum.TryParse<LogLevel>(requested, ignoreCase: true, out var level) && Enum.IsDefined(level)
+            ? level
+            : DefaultLogLevel;
+    }
+
     // Baked in at build time via the BugsplatDatabase MSBuild property (see RadegastVeles.csproj).
     private static string? BugsplatDatabase =>
         Assembly.GetExecutingAssembly()
             .GetCustomAttributes<AssemblyMetadataAttribute>()
             .FirstOrDefault(a => a.Key == "BugsplatDatabase")?.Value;
 
+    /// <summary>The application's logger factory, for components that take an <see cref="ILogger"/>.</summary>
+    public static ILoggerFactory LogFactory { get; private set; } = NullLoggerFactory.Instance;
+
+    /// <summary>
+    /// A command from the command line that no running copy took, to be carried out by this
+    /// copy once it has started.
+    /// </summary>
+    internal static AppCommand? StartupCommand { get; private set; }
+
+    /// <summary>The options this copy was started with.</summary>
+    internal static LaunchOptions LaunchOptions { get; private set; } = LaunchOptions.Parse([]);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool AttachConsole(int processId);
+
+    /// <summary>
+    /// Handles the options that print something and exit. Returns true if the program is done.
+    /// </summary>
+    private static bool RunConsoleOptions(LaunchOptions options)
+    {
+        if (!options.ShowHelp && !options.ShowVersion && !options.ListGrids && options.Errors.Count == 0)
+            return false;
+
+        // A Windows GUI program has no console of its own; borrow the one it was started from.
+        if (OperatingSystem.IsWindows() && AttachConsole(-1))
+        {
+            Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+            Console.SetError(new StreamWriter(Console.OpenStandardError()) { AutoFlush = true });
+        }
+
+        foreach (var error in options.Errors)
+            Console.Error.WriteLine(error);
+
+        if (options.ShowHelp)
+        {
+            Console.WriteLine(LaunchOptions.HelpText);
+            return true;
+        }
+        if (options.ShowVersion)
+        {
+            Console.WriteLine("Radegast Veles " + (Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown"));
+            return true;
+        }
+        if (options.ListGrids)
+        {
+            Directory.SetCurrentDirectory(AppContext.BaseDirectory);
+            var grids = new GridManager();
+            grids.LoadGrids();
+            Console.WriteLine($"{"Grid ID",-25} Grid Name");
+            foreach (var grid in grids.Grids)
+                Console.WriteLine($"{grid.ID,-25} {grid.Name}");
+            return true;
+        }
+
+        Console.Error.WriteLine("Run with --help for the list of options.");
+        return false;
+    }
+
     [STAThread]
     public static void Main(string[] args)
     {
+        var options = LaunchOptions.Parse(args);
+        if (RunConsoleOptions(options)) return;
+        if (options.PasswordFromStandardInput) options.SupplyPassword(Console.In.ReadLine());
+        LaunchOptions = options;
+
+        if (AppCommand.TryParse(args, out var command))
+        {
+            if (AppCommandChannel.TrySend(AppCommandChannel.DefaultEndpoint(), command)) return;
+            // With no running copy there is nothing to exit or log out; the rest start the program.
+            if (command.Kind is AppCommandKind.Exit or AppCommandKind.LogoutSession) return;
+            StartupCommand = command;
+        }
+
         // Legacy Radegast (Radegast/Program.cs) does the same for the same reason: several
         // pieces of shared code (LibreMetaverse.LslTools' LslSyntax, shader_data lookups, etc.)
         // resolve their own asset paths relative to the current working directory rather than
@@ -67,11 +158,12 @@ internal static class Program
 
         var loggerFactory = LoggerFactory.Create(builder =>
         {
-            builder.SetMinimumLevel(LogLevel.Debug);
+            builder.SetMinimumLevel(ResolveLogLevel());
             builder.AddProvider(new VelesLogProvider());
             builder.AddProvider(new SeedCapsRetryGuard());
         });
         Logger.SetLoggerFactory(loggerFactory, "RadegastVeles");
+        LogFactory = loggerFactory;
 
         // On .NET 8+ CoreJ2K no longer discovers image-creator plugins by reflection; each
         // plugin assembly (CoreJ2K.Skia, CoreJ2K.Avalonia) instead self-registers via a
@@ -131,11 +223,10 @@ internal static class Program
                 ExceptionType = BugSplat.ExceptionTypeId.DotNetStandard,
             };
             BugSplat.Attachments.Add(new FileInfo(logFilePath));
-
-            // Hook all unhandled exception sources
-            AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
-            TaskScheduler.UnobservedTaskException      += OnUnobservedTaskException;
         }
+
+        AppDomain.CurrentDomain.UnhandledException += OnUnhandledException;
+        TaskScheduler.UnobservedTaskException      += OnUnobservedTaskException;
 
         try
         {
@@ -143,6 +234,8 @@ internal static class Program
         }
         catch (Exception ex) when (!System.Diagnostics.Debugger.IsAttached)
         {
+            Logger.Critical("Unhandled exception on the UI thread; Veles is closing.", ex);
+            VelesLogProvider.Flush();
             BugSplat?.Post(ex);
 #if !DEBUG
             ShowCrashWindow(ex);
@@ -167,6 +260,8 @@ internal static class Program
     {
         if (e.ExceptionObject is Exception ex)
         {
+            Logger.Critical($"Unhandled exception (terminating: {e.IsTerminating}).", ex);
+            VelesLogProvider.Flush();
             BugSplat?.Post(ex);
 #if !DEBUG
             ShowCrashWindow(ex);
@@ -174,13 +269,13 @@ internal static class Program
         }
     }
 
+    // A background task failed and nothing awaited it. The process keeps running, so this is
+    // recorded and reported but is not presented to the user as a crash.
     private static void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
     {
-        BugSplat?.Post(e.Exception);
         e.SetObserved();
-#if !DEBUG
-        ShowCrashWindow(e.Exception);
-#endif
+        Logger.Error("A background task failed and its error was never observed.", e.Exception);
+        BugSplat?.Post(e.Exception);
     }
 
     private static void ShowCrashWindow(Exception ex)

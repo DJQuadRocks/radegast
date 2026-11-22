@@ -414,7 +414,7 @@ namespace Radegast.Media
                 if (Environment.OSVersion.Platform == PlatformID.Unix || Environment.OSVersion.Platform == PlatformID.MacOSX)
                 {
                     bool audioOK = false;
-                    OUTPUTTYPE[] outputsToTry = Environment.OSVersion.Platform == PlatformID.MacOSX
+                    OUTPUTTYPE[] outputsToTry = RuntimeInformation.IsOSPlatform(OSPlatform.OSX)
                         ? new[] { OUTPUTTYPE.COREAUDIO, OUTPUTTYPE.AUTODETECT }
                         : new[] { OUTPUTTYPE.PULSEAUDIO, OUTPUTTYPE.ALSA, OUTPUTTYPE.AUTODETECT };
 
@@ -1731,12 +1731,12 @@ namespace Radegast.Media
                     cached.AccessCount++;
                     
                     CacheHits++;
-                    Logger.Debug($"Cache HIT for sound {soundId}");
+                    Logger.Trace($"Cache HIT for sound {soundId}");
                     return cached.Data;
                 }
 
                 CacheMisses++;
-                Logger.Debug($"Cache MISS for sound {soundId}");
+                Logger.Trace($"Cache MISS for sound {soundId}");
                 return null;
             }
         }

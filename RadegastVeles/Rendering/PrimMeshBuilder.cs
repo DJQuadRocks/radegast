@@ -59,16 +59,16 @@ internal sealed class PrimMeshBuilder(GridClient client)
     private readonly object                          _pbrCacheLock = new();
 
     // ── Decoded-mesh cache ────────────────────────────────────────────────────────
-    // Mesh assets are immutable per UUID and always decoded at DetailLevel.Highest, so
-    // decoded geometry is shared process-wide across linksets, attachments, and builder
-    // instances. TransformTexCoords mutates face.Vertices in place during face packing,
+    // Mesh assets are immutable per UUID, so geometry decoded at a given level of detail is
+    // shared process-wide across linksets, attachments, and builder instances. TransformTexCoords mutates face.Vertices in place during face packing,
     // so cached meshes are NEVER handed out directly — every consumer gets a per-prim
     // clone with fresh Vertices lists (Indices/Weights/TexCoords1/SkinData stay shared;
     // nothing downstream mutates them).
-    private sealed record CachedMesh(UUID AssetId, FacetedMesh Mesh, int VertexCount);
+    private readonly record struct MeshKey(UUID AssetId, DetailLevel Lod);
+    private sealed record CachedMesh(MeshKey Key, FacetedMesh Mesh, int VertexCount);
 
     private static readonly object MeshCacheLock = new();
-    private static readonly Dictionary<UUID, LinkedListNode<CachedMesh>> MeshCache = new();
+    private static readonly Dictionary<MeshKey, LinkedListNode<CachedMesh>> MeshCache = new();
     private static readonly LinkedList<CachedMesh> MeshCacheLru = new(); // head = most recently used
     private static long _meshCacheVertexTotal;
     private static long _meshCacheMaxVertices = DefaultMeshCacheMaxVertices;
@@ -97,7 +97,7 @@ internal sealed class PrimMeshBuilder(GridClient client)
     // same mesh share one download and one decode instead of racing N of each.
     // Lazy wrapper: GetOrAdd may call the factory more than once under race, but only
     // the stored Lazy ever executes, so exactly one download runs per asset id.
-    private static readonly ConcurrentDictionary<UUID, Lazy<Task<FacetedMesh?>>> MeshFetchInflight = new();
+    private static readonly ConcurrentDictionary<MeshKey, Lazy<Task<FacetedMesh?>>> MeshFetchInflight = new();
 
     private static long _meshCacheHits, _meshCacheMisses;
     /// <summary>Decoded-mesh cache hits since process start (telemetry).</summary>
@@ -105,11 +105,11 @@ internal sealed class PrimMeshBuilder(GridClient client)
     /// <summary>Decoded-mesh cache misses since process start (telemetry).</summary>
     public static long MeshCacheMisses => Interlocked.Read(ref _meshCacheMisses);
 
-    private static bool TryGetCachedMesh(UUID assetId, out FacetedMesh mesh)
+    private static bool TryGetCachedMesh(UUID assetId, DetailLevel lod, out FacetedMesh mesh)
     {
         lock (MeshCacheLock)
         {
-            if (MeshCache.TryGetValue(assetId, out var node))
+            if (MeshCache.TryGetValue(new MeshKey(assetId, lod), out var node))
             {
                 MeshCacheLru.Remove(node);
                 MeshCacheLru.AddFirst(node);
@@ -135,7 +135,7 @@ internal sealed class PrimMeshBuilder(GridClient client)
     {
         lock (MeshCacheLock)
         {
-            if (MeshCache.TryGetValue(assetId, out var node))
+            if (MeshCache.TryGetValue(new MeshKey(assetId, DetailLevel.Highest), out var node))
             {
                 vertexCount = node.Value.VertexCount;
                 return true;
@@ -145,7 +145,7 @@ internal sealed class PrimMeshBuilder(GridClient client)
         return false;
     }
 
-    private static void AddToMeshCache(UUID assetId, FacetedMesh mesh)
+    private static void AddToMeshCache(MeshKey key, FacetedMesh mesh)
     {
         int vertexCount = 0;
         foreach (var f in mesh.Faces)
@@ -153,9 +153,9 @@ internal sealed class PrimMeshBuilder(GridClient client)
 
         lock (MeshCacheLock)
         {
-            if (MeshCache.ContainsKey(assetId)) return;
-            var node = MeshCacheLru.AddFirst(new CachedMesh(assetId, mesh, vertexCount));
-            MeshCache[assetId] = node;
+            if (MeshCache.ContainsKey(key)) return;
+            var node = MeshCacheLru.AddFirst(new CachedMesh(key, mesh, vertexCount));
+            MeshCache[key] = node;
             _meshCacheVertexTotal += vertexCount;
             EvictMeshCacheOverBudgetLocked();
         }
@@ -169,7 +169,7 @@ internal sealed class PrimMeshBuilder(GridClient client)
         {
             var last = MeshCacheLru.Last!.Value;
             MeshCacheLru.RemoveLast();
-            MeshCache.Remove(last.AssetId);
+            MeshCache.Remove(last.Key);
             _meshCacheVertexTotal -= last.VertexCount;
         }
     }
@@ -208,10 +208,11 @@ internal sealed class PrimMeshBuilder(GridClient client)
     /// the download for everyone else, and a completed download still lands in the cache
     /// for the follow-up build. Callers bound their own wait with Task.WaitAsync(ct).
     /// </summary>
-    private Task<FacetedMesh?> FetchDecodedMeshAsync(Primitive prim, UUID assetId)
+    private Task<FacetedMesh?> FetchDecodedMeshAsync(Primitive prim, UUID assetId, DetailLevel lod)
     {
-        return MeshFetchInflight.GetOrAdd(assetId, id => new Lazy<Task<FacetedMesh?>>(() => Task.Run(async () =>
+        return MeshFetchInflight.GetOrAdd(new MeshKey(assetId, lod), key => new Lazy<Task<FacetedMesh?>>(() => Task.Run(async () =>
         {
+            var id = key.AssetId;
             try
             {
                 // RequestMeshAsync catches everything internally (including cancellation from
@@ -219,6 +220,7 @@ internal sealed class PrimMeshBuilder(GridClient client)
                 // timeout/cancellation handling is needed here -- see its own try/catch in
                 // AssetManager.
                 using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+                await WaitForMeshCapabilityAsync(timeout.Token).ConfigureAwait(false);
                 var meshAsset = await client.Assets.RequestMeshAsync(id, timeout.Token).ConfigureAwait(false);
                 if (meshAsset == null)
                 {
@@ -230,9 +232,9 @@ internal sealed class PrimMeshBuilder(GridClient client)
                     return null;
                 }
 
-                var mesh = _mesher.GenerateFacetedMeshMesh(prim, meshAsset.AssetData);
-                if (mesh == null)
-                    Logger.Log($"PrimMeshBuilder: mesh asset {id} failed to decode (GenerateFacetedMeshMesh returned null)", LogLevel.Debug);
+                var mesh = DecodeMesh(prim, meshAsset, key.Lod);
+                if (mesh == null && UndecodableMeshes.TryAdd(id, 0))
+                    Logger.Log($"PrimMeshBuilder: mesh asset {id} cannot be decoded and will not be requested again", LogLevel.Warning);
                 if (mesh != null)
                 {
                     // Detach the requesting prim before caching: a cached canonical must
@@ -247,7 +249,7 @@ internal sealed class PrimMeshBuilder(GridClient client)
                         f.TextureFace = new Primitive.TextureEntryFace(null);
                         mesh.Faces[i] = f;
                     }
-                    AddToMeshCache(id, mesh);
+                    AddToMeshCache(key, mesh);
                 }
                 return mesh;
             }
@@ -255,9 +257,88 @@ internal sealed class PrimMeshBuilder(GridClient client)
             {
                 // Success: future callers hit the decode cache. Failure: removing the
                 // entry lets a later build retry instead of latching the null forever.
-                MeshFetchInflight.TryRemove(id, out _);
+                MeshFetchInflight.TryRemove(key, out _);
             }
         }))).Value;
+    }
+
+    // Mesh assets never change, so one that fails to decode is not fetched or decoded again.
+    private static readonly ConcurrentDictionary<UUID, byte> UndecodableMeshes = new();
+
+    private const int MeshCapabilityWaitMs = 20_000;
+    private const int MeshCapabilityPollMs = 250;
+
+    // RequestMeshAsync returns null at once while the region's capabilities are still being
+    // fetched, which is the case just after login, a teleport or a region crossing.
+    private async Task WaitForMeshCapabilityAsync(CancellationToken ct)
+    {
+        for (int waited = 0; waited < MeshCapabilityWaitMs; waited += MeshCapabilityPollMs)
+        {
+            if (client.Network.CurrentSim?.Caps?.GetMeshCapURI() != null) return;
+            try { await Task.Delay(MeshCapabilityPollMs, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+        }
+    }
+
+    /// <summary>
+    /// Decodes <paramref name="meshAsset"/> at <paramref name="lod"/>. A level the asset
+    /// leaves out or leaves empty is replaced by the next more detailed one that has geometry.
+    /// </summary>
+    private FacetedMesh? DecodeMesh(Primitive prim, AssetMesh meshAsset, DetailLevel lod)
+    {
+        for (var level = lod; level < DetailLevel.Highest; level++)
+        {
+            if (FacetedMesh.TryDecodeFromAsset(prim, meshAsset, level, out var decoded)
+                && decoded != null && HasGeometry(decoded))
+                return decoded;
+        }
+        return _mesher.GenerateFacetedMeshMesh(prim, meshAsset.AssetData);
+    }
+
+    private static bool HasGeometry(FacetedMesh mesh)
+    {
+        foreach (var f in mesh.Faces)
+            if (f.Vertices is { Count: > 0 } && f.Indices is { Count: > 0 }) return true;
+        return false;
+    }
+
+    // RenderVolumeLODFactor in the SL viewer; 2.0 is its high-quality default.
+    private const float MeshLodFactor = 2f;
+
+    /// <summary>
+    /// Level of detail for a mesh prim of size <paramref name="scale"/> seen from
+    /// <paramref name="distance"/> metres, following LLVOVolume::calcLOD.
+    /// </summary>
+    public static DetailLevel MeshLodFor(Vector3 scale, float distance)
+    {
+        float radius = 0.5f * scale.Length();
+        if (radius <= 0f || distance <= 0f) return DetailLevel.Highest;
+
+        float ramp = MeshLodFactor * 2f;
+        if (distance < ramp) distance = distance * distance / ramp;
+        distance *= MathF.PI / 3f;
+
+        float tan = MeshLodFactor * radius / distance;
+        if (tan <= 0.03f) return DetailLevel.Low;
+        if (tan <= 0.06f) return DetailLevel.Medium;
+        if (tan <= 0.24f) return DetailLevel.High;
+        return DetailLevel.Highest;
+    }
+
+    /// <summary>
+    /// Level of detail for one mesh prim of a linkset. <paramref name="lodViewPosition"/> is
+    /// the viewer's position in the linkset's region; null selects full detail.
+    /// </summary>
+    public static DetailLevel MeshLodFor(Primitive prim, Primitive root, Vector3? lodViewPosition)
+    {
+        if (lodViewPosition is not { } viewPos) return DetailLevel.Highest;
+        var pos = new Vector3(root.Position.X, root.Position.Y, root.Position.Z);
+        if (prim.LocalID != root.LocalID)
+        {
+            var rootRot = new Quaternion(root.Rotation.X, root.Rotation.Y, root.Rotation.Z, root.Rotation.W);
+            pos += Vector3.Transform(new Vector3(prim.Position.X, prim.Position.Y, prim.Position.Z), rootRot);
+        }
+        return MeshLodFor(new Vector3(prim.Scale.X, prim.Scale.Y, prim.Scale.Z), Vector3.Distance(pos, viewPos));
     }
 
     /// <summary>
@@ -268,8 +349,10 @@ internal sealed class PrimMeshBuilder(GridClient client)
     /// scheduler so tessellation slots never sit idle waiting on the network.
     /// Failures are ignored — tessellation falls back to its own download path.
     /// </summary>
-    public async Task PrefetchLinksetAssetsAsync(IReadOnlyList<Primitive> prims, CancellationToken ct)
+    public async Task PrefetchLinksetAssetsAsync(IReadOnlyList<Primitive> prims, CancellationToken ct,
+        uint rootLocalId = 0, Vector3? lodViewPosition = null)
     {
+        var root = prims.FirstOrDefault(p => p.LocalID == rootLocalId) ?? prims[0];
         List<Task>? fetches = null;
         var seen = new HashSet<UUID>();
         foreach (var prim in prims)
@@ -281,8 +364,10 @@ internal sealed class PrimMeshBuilder(GridClient client)
             fetches ??= new List<Task>();
             if (sculpt.Type == SculptType.Mesh)
             {
-                if (!TryGetCachedMesh(sculpt.SculptTexture, out _))
-                    fetches.Add(FetchDecodedMeshAsync(prim, sculpt.SculptTexture).WaitAsync(ct));
+                var lod = MeshLodFor(prim, root, lodViewPosition);
+                if (!UndecodableMeshes.ContainsKey(sculpt.SculptTexture)
+                    && !TryGetCachedMesh(sculpt.SculptTexture, lod, out _))
+                    fetches.Add(FetchDecodedMeshAsync(prim, sculpt.SculptTexture, lod).WaitAsync(ct));
             }
             else
             {
@@ -332,9 +417,11 @@ internal sealed class PrimMeshBuilder(GridClient client)
         bool                    isHud                  = false,
         DetailLevel             detailLevel            = DetailLevel.High,
         IProgress<SceneTexturePatch>? texturePatch     = null,
-        int                     textureResolutionLevel = -1)
+        int                     textureResolutionLevel = -1,
+        Action?                 onMeshUnavailable      = null,
+        Vector3?                lodViewPosition        = null)
     {
-        var (rawFaces, bMin, bMax, flexiPrims, animeshSkins) = await TessellateAsync(prims, rootLocalId, progress, ct, isHud, detailLevel)
+        var (rawFaces, bMin, bMax, flexiPrims, animeshSkins) = await TessellateAsync(prims, rootLocalId, progress, ct, isHud, detailLevel, onMeshUnavailable, lodViewPosition)
                                                                    .ConfigureAwait(false);
 
         ct.ThrowIfCancellationRequested();
@@ -394,7 +481,9 @@ internal sealed class PrimMeshBuilder(GridClient client)
         IProgress<string>?      progress,
         CancellationToken       ct,
         bool                    isHud       = false,
-        DetailLevel             detailLevel = DetailLevel.High)
+        DetailLevel             detailLevel = DetailLevel.High,
+        Action?                 onMeshUnavailable = null,
+        Vector3?                lodViewPosition = null)
     {
         var faces        = new List<RawFace>();
         var flexiPrims   = new List<FlexiPrimInfo>();
@@ -413,7 +502,10 @@ internal sealed class PrimMeshBuilder(GridClient client)
             progress?.Report($"Building mesh ({primNum} / {prims.Count})…");
 
             // ── Sculpt / Mesh / Parametric ────────────────────────────────
-            var mesh = await GetPrimMeshAsync(prim, ct, detailLevel).ConfigureAwait(false);
+            var mesh = await GetPrimMeshAsync(prim, ct, detailLevel, MeshLodFor(prim, rootPrim, lodViewPosition)).ConfigureAwait(false);
+            if (mesh == null && prim.Sculpt is { Type: SculptType.Mesh } badSculpt
+                && UndecodableMeshes.ContainsKey(badSculpt.SculptTexture))
+                continue;
             if (mesh == null)
             {
                 // Silent before this: a failed mesh fetch/decode (timeout, bad asset, decode
@@ -425,6 +517,7 @@ internal sealed class PrimMeshBuilder(GridClient client)
                     $"PrimMeshBuilder: mesh unavailable for prim {prim.LocalID} " +
                     $"(sculpt={prim.Sculpt?.SculptTexture}), skipping -- object will be missing faces",
                     LogLevel.Warning);
+                onMeshUnavailable?.Invoke();
                 continue;
             }
 
@@ -589,17 +682,23 @@ internal sealed class PrimMeshBuilder(GridClient client)
         return (faces, bMin, bMax, flexiPrims, animeshSkins);
     }
 
-    private async Task<FacetedMesh?> DownloadMeshAsync(Primitive prim, CancellationToken ct)
+    private async Task<FacetedMesh?> DownloadMeshAsync(Primitive prim, CancellationToken ct, DetailLevel lod)
     {
         var meshId = prim.Sculpt!.SculptTexture;
+        if (UndecodableMeshes.ContainsKey(meshId)) return null;
 
-        if (TryGetCachedMesh(meshId, out var cached))
-            return CloneMeshForPrim(cached, prim);
+        if (!TryGetCachedMesh(meshId, lod, out var canonical))
+            canonical = (await FetchDecodedMeshAsync(prim, meshId, lod).WaitAsync(ct).ConfigureAwait(false))!;
+        if (canonical == null) return null;
 
-        var canonical = await FetchDecodedMeshAsync(prim, meshId).WaitAsync(ct).ConfigureAwait(false);
+        // A rigged mesh is sized by its skeleton, not by the prim's scale, so the level
+        // chosen from the prim's size does not apply to it.
+        if (lod != DetailLevel.Highest && canonical.SkinData != null)
+            return await DownloadMeshAsync(prim, ct, DetailLevel.Highest).ConfigureAwait(false);
+
         // Clone even for the first caller: concurrent awaiters of the same in-flight
         // fetch all receive the same canonical instance, and face packing mutates it.
-        return canonical == null ? null : CloneMeshForPrim(canonical, prim);
+        return CloneMeshForPrim(canonical, prim);
     }
 
     // ── Texture fetching ──────────────────────────────────────────────────────────
@@ -926,6 +1025,9 @@ internal sealed class PrimMeshBuilder(GridClient client)
                 // `bmp` would leak; wrapping in try/finally ensures disposal on any exit.
                 if (texturePatch != null)
                 {
+                    var compressed = textureResolutionLevel == -1 && VkApi.IsInitialized && VkApi.Context.SupportsBc3
+                        ? TextureDiskCache.TryGetCompressedPixels(id)
+                        : null;
                     bool bmpOwned = true; // we still own bmp until the last Report succeeds
                     try
                     {
@@ -942,6 +1044,7 @@ internal sealed class PrimMeshBuilder(GridClient client)
                                     TextureHasAlpha    = texHasAlpha,
                                     ResolutionLevel    = textureResolutionLevel,
                                     TextureId          = id,
+                                    CompressedPixels   = compressed,
                                 });
                             }
                         }
@@ -1445,7 +1548,7 @@ internal sealed class PrimMeshBuilder(GridClient client)
 
     /// <summary>Tessellates a single prim into a <see cref="FacetedMesh"/>.</summary>
     private async Task<FacetedMesh?> GetPrimMeshAsync(Primitive prim, CancellationToken ct,
-        DetailLevel detailLevel = DetailLevel.High)
+        DetailLevel detailLevel = DetailLevel.High, DetailLevel meshLod = DetailLevel.Highest)
     {
         // Linden tree/grass: PCode takes priority over Sculpt/parametric -- neither of those
         // shape systems is meaningful for foliage (PathCurve/ProfileCurve are leftover/default
@@ -1488,7 +1591,7 @@ internal sealed class PrimMeshBuilder(GridClient client)
             }
             else
             {
-                return await DownloadMeshAsync(prim, ct).ConfigureAwait(false);
+                return await DownloadMeshAsync(prim, ct, meshLod).ConfigureAwait(false);
             }
         }
         return _mesher.GenerateFacetedMesh(prim, detailLevel);
@@ -1676,11 +1779,12 @@ internal sealed class PrimMeshBuilder(GridClient client)
 
             var tOrth = t - n * Vector3.Dot(n, t);
             float len  = tOrth.Length();
-            if (len < 1e-6f) continue; // degenerate — leave as zero (fallback to screen-space)
+            // Degenerate or not a number (a mesh can carry NaN normals or texture
+            // coordinates): leave as zero, which falls back to screen-space tangents.
+            if (!(len >= 1e-6f)) continue;
             tOrth /= len;
 
-            float w = MathF.Sign(Vector3.Dot(Vector3.Cross(n, tOrth), b));
-            if (w == 0f) w = 1f;
+            float w = Vector3.Dot(Vector3.Cross(n, tOrth), b) < 0f ? -1f : 1f;
 
             verts[o + 8]  = tOrth.X;
             verts[o + 9]  = tOrth.Y;

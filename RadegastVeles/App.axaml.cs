@@ -38,12 +38,20 @@ public class App : Application
     private LoginWindow? _loginWindow;
     private TrayIcon? _trayIcon;
 
-    // Avalonia.Native's macOS tray-menu exporter tracks incremental changes against whatever
-    // NativeMenu instance it was first bound to via TrayIcon.Menu; swapping in a brand-new
-    // NativeMenu on every rebuild (as this used to do) throws "The menu being updated does not
-    // match" from __MicroComIAvnMenuProxy.Update the next time it's reassigned -- unhandled,
-    // that aborts the whole process. Reuse one instance and mutate its Items instead.
-    private readonly NativeMenu _trayMenu = new();
+    // Avalonia.Native's macOS tray-menu exporter binds to the first NativeMenu instance it sees
+    // for a TrayIcon and throws "The menu being updated does not match" from
+    // __MicroComIAvnMenuProxy.Update if it is ever handed a different one -- unhandled, that
+    // aborts the whole process. Since Avalonia 12.1 the native tray icon is created when the icon
+    // is attached (during XAML load) and binds to an empty NativeMenu if none is set yet, so the
+    // menu is declared in App.axaml and we mutate that same instance's Items from here on.
+    private NativeMenu? _trayMenu;
+
+    // The macOS Dock icon's menu. One instance, set once and then only its Items change, for
+    // the same reason as _trayMenu. The Dock appends its own Quit item below these.
+    private NativeMenu? _dockMenu;
+    private bool _shuttingDown;
+    private AppCommandChannel? _commandChannel;
+    private bool _launchOptionsUsed;
 
     public override void Initialize()
     {
@@ -55,18 +63,45 @@ public class App : Application
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             desktop.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            Radegast.Veles.Core.MacDockIcon.Apply();
 
             var icons = TrayIcon.GetIcons(this);
             if (icons?.Count > 0)
             {
                 _trayIcon = icons[0];
                 _trayIcon.Clicked += (_, _) => TrayClick();
-                RebuildTrayMenu();
+            }
+
+            if (OperatingSystem.IsMacOS())
+            {
+                _dockMenu = new NativeMenu();
+                NativeDock.SetMenu(this, _dockMenu);
+            }
+            RebuildMenus();
+
+            // A quit that comes from the system (the Dock's Quit item, Cmd+Q, logout) closes
+            // every window; main windows otherwise hide instead of closing, which would cancel it.
+            desktop.ShutdownRequested += (_, _) => CloseEverything();
+
+            // Clicking the Dock icon while every window is hidden brings one back.
+            if (this.TryGetFeature<IActivatableLifetime>() is { } activatable)
+            {
+                activatable.Activated += (_, e) =>
+                {
+                    if (e.Kind != ActivationKind.Reopen || _shuttingDown) return;
+                    bool anyVisible = _loginWindow is { IsVisible: true }
+                                      || _agentWindows.Values.Any(w => w.IsVisible);
+                    if (!anyVisible) TrayClick();
+                };
             }
 
             VelesUpdateManager.Start();
 
+            _commandChannel = AppCommandChannel.TryListen(AppCommandChannel.DefaultEndpoint(),
+                command => Avalonia.Threading.Dispatcher.UIThread.Post(() => RunCommand(command)));
+
             ShowLogin();
+            if (Program.StartupCommand is { } startupCommand) RunCommand(startupCommand);
         }
 
         base.OnFrameworkInitializationCompleted();
@@ -80,7 +115,10 @@ public class App : Application
             return;
         }
 
-        _loginWindow = new LoginWindow(_credentialManager);
+        // The command line's login options fill in the first login window only.
+        var launchOptions = _launchOptionsUsed ? null : Program.LaunchOptions;
+        _launchOptionsUsed = true;
+        _loginWindow = new LoginWindow(_credentialManager, launchOptions);
         _loginWindow.LoginSucceeded += OnLoginSucceeded;
         _loginWindow.Show();
     }
@@ -102,7 +140,7 @@ public class App : Application
         mainWindow.Show();
         mainWindow.Activate();
 
-        RebuildTrayMenu();
+        RebuildMenus();
     }
 
     private void OnLogoutRequested(AgentSession session)
@@ -114,7 +152,7 @@ public class App : Application
         }
 
         _sessionManager.RemoveSession(session);
-        RebuildTrayMenu();
+        RebuildMenus();
 
         if (_sessionManager.Sessions.Count == 0)
         {
@@ -136,11 +174,85 @@ public class App : Application
         }
     }
 
-    private void RebuildTrayMenu()
+    private void RunCommand(AppCommand command)
     {
+        if (_shuttingDown) return;
+
+        switch (command.Kind)
+        {
+            case AppCommandKind.NewLogin:
+                ShowLogin();
+                break;
+            case AppCommandKind.CheckForUpdates:
+                VelesUpdateManager.CheckForUpdatesAtUserRequest();
+                break;
+            case AppCommandKind.Exit:
+                Exit();
+                break;
+            case AppCommandKind.ShowSession:
+                if (_agentWindows.TryGetValue(command.SessionId, out var window))
+                {
+                    window.Show();
+                    window.Activate();
+                }
+                else
+                {
+                    TrayClick();
+                }
+                break;
+            case AppCommandKind.LogoutSession:
+                var session = _sessionManager.Sessions.FirstOrDefault(s => s.Id == command.SessionId);
+                if (session != null) OnLogoutRequested(session);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// The tasks on the Windows taskbar button: the same entries as the tray menu. With
+    /// <paramref name="includeSessions"/> false only the entries that make sense while the
+    /// program is not running remain.
+    /// </summary>
+    private List<(string Title, AppCommand Command)?> BuildTaskList(bool includeSessions)
+    {
+        var tasks = new List<(string Title, AppCommand Command)?>();
+        if (includeSessions)
+        {
+            foreach (var session in _sessionManager.Sessions)
+            {
+                tasks.Add(($"Show {session.AgentName}", new AppCommand(AppCommandKind.ShowSession, session.Id)));
+                tasks.Add(($"Logout {session.AgentName}", new AppCommand(AppCommandKind.LogoutSession, session.Id)));
+            }
+            if (tasks.Count > 0) tasks.Add(null);
+        }
+
+        tasks.Add(("New Login", new AppCommand(AppCommandKind.NewLogin)));
+        tasks.Add(("Check for Updates...", new AppCommand(AppCommandKind.CheckForUpdates)));
+        if (includeSessions)
+        {
+            tasks.Add(null);
+            tasks.Add(("Exit", new AppCommand(AppCommandKind.Exit)));
+        }
+        return tasks;
+    }
+
+    private void RebuildMenus()
+    {
+        if (_dockMenu != null) FillAppMenu(_dockMenu, includeExit: false);
+        if (OperatingSystem.IsWindows()) WindowsJumpList.SetTasks(BuildTaskList(includeSessions: true));
+
         if (_trayIcon == null) return;
 
-        _trayMenu.Items.Clear();
+        // Fall back to a fresh menu only if the XAML-declared one is missing (pre-12.1 behaviour).
+        var trayMenu = _trayMenu ??= _trayIcon.Menu ?? new NativeMenu();
+        FillAppMenu(trayMenu, includeExit: true);
+
+        if (!ReferenceEquals(_trayIcon.Menu, trayMenu))
+            _trayIcon.Menu = trayMenu;
+    }
+
+    private void FillAppMenu(NativeMenu menu, bool includeExit)
+    {
+        menu.Items.Clear();
 
         foreach (var session in _sessionManager.Sessions)
         {
@@ -156,36 +268,39 @@ public class App : Application
                     w.Activate();
                 }
             };
-            _trayMenu.Items.Add(showItem);
+            menu.Items.Add(showItem);
 
             var logoutItem = new NativeMenuItem($"Logout {agentName}");
             logoutItem.Click += (_, _) => OnLogoutRequested(capturedSession);
-            _trayMenu.Items.Add(logoutItem);
+            menu.Items.Add(logoutItem);
 
-            _trayMenu.Items.Add(new NativeMenuItemSeparator());
+            menu.Items.Add(new NativeMenuItemSeparator());
         }
 
         var loginItem = new NativeMenuItem("New Login");
         loginItem.Click += (_, _) => ShowLogin();
-        _trayMenu.Items.Add(loginItem);
+        menu.Items.Add(loginItem);
 
-        _trayMenu.Items.Add(new NativeMenuItemSeparator());
+        menu.Items.Add(new NativeMenuItemSeparator());
 
         var checkForUpdatesItem = new NativeMenuItem("Check for Updates...");
         checkForUpdatesItem.Click += (_, _) => VelesUpdateManager.CheckForUpdatesAtUserRequest();
-        _trayMenu.Items.Add(checkForUpdatesItem);
+        menu.Items.Add(checkForUpdatesItem);
 
-        _trayMenu.Items.Add(new NativeMenuItemSeparator());
+        if (!includeExit) return;
+
+        menu.Items.Add(new NativeMenuItemSeparator());
 
         var exitItem = new NativeMenuItem("Exit");
         exitItem.Click += (_, _) => Exit();
-        _trayMenu.Items.Add(exitItem);
-
-        _trayIcon.Menu = _trayMenu;
+        menu.Items.Add(exitItem);
     }
 
-    private void Exit()
+    private void CloseEverything()
     {
+        if (_shuttingDown) return;
+        _shuttingDown = true;
+
         foreach (var window in _agentWindows.Values.ToArray())
         {
             window.ForceClose();
@@ -194,6 +309,16 @@ public class App : Application
 
         _loginWindow?.Close();
         _sessionManager.Dispose();
+
+        _commandChannel?.Dispose();
+        _commandChannel = null;
+        // The task list outlives the process, so leave one that works without it.
+        if (OperatingSystem.IsWindows()) WindowsJumpList.SetTasks(BuildTaskList(includeSessions: false));
+    }
+
+    private void Exit()
+    {
+        CloseEverything();
 
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {

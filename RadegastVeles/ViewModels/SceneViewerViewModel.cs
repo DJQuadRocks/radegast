@@ -305,6 +305,7 @@ public partial class SceneViewerViewModel : ObservableObject, IDisposable
         _viewport.ObjectRightClicked    += OnObjectRightClicked;
         _viewport.GroundClicked         += OnGroundClicked;
         _viewport.MouselookChanged      += OnMouselookChanged;
+        _viewport.FrameUpdate           += OnViewportFrame;
         _viewport.TerrainHeightProvider = (x, y) =>
         {
             var sim = _instance.Client.Network.CurrentSim;
@@ -537,12 +538,9 @@ public partial class SceneViewerViewModel : ObservableObject, IDisposable
         // Only update labels if this is the currently selected object.
         // Diagnostic logging (2026-09-05) on every bail-out below, kept -- see InspectObject's
         // own comment for why.
-        if (SelectedLocalId == 0)
-        {
-            LibreMetaverse.Logger.Debug(
-                $"[SceneViewerViewModel] OnObjectProperties: discarded, nothing selected (reply objectId={e.Properties.ObjectID})");
-            return;
-        }
+        // With nothing selected here, every reply belongs to another consumer (the Objects
+        // panel requests properties for each prim it lists), so it is not worth a log line.
+        if (SelectedLocalId == 0) return;
         var sim = _instance.Client.Network.CurrentSim;
         if (sim == null || e.Simulator != sim)
         {
@@ -1194,14 +1192,15 @@ public partial class SceneViewerViewModel : ObservableObject, IDisposable
             ? new Vector3(128f, 128f, sim.WaterHeight + 2f)
             : new Vector3(pos.X, pos.Y, pos.Z + 1.0f); // eye-level target
 
-        // Derive the camera yaw from the avatar's current heading so it starts
-        // directly behind the avatar (heading + 180°), matching SL's follow-camera.
-        // Avatar faces +X at rest; SimRotation is a Z-up quaternion.
-        var rot = _instance.Client.Self.SimRotation;
-        float headingRad = MathF.Atan2(
-            2f * (rot.W * rot.Z + rot.X * rot.Y),
-            1f - 2f * (rot.Y * rot.Y + rot.Z * rot.Z));
-        float cameraYaw = headingRad * (180f / MathF.PI) + 180f;
+        // Start directly behind the avatar (heading + 180°). The heading comes from where the
+        // avatar's forward (+X) axis points on the ground plane, taken from the pose it is
+        // drawn with when there is one (that pose is in world space even when seated).
+        var selfRot = _instance.Client.Self.SimRotation;
+        var rotation = new System.Numerics.Quaternion(selfRot.X, selfRot.Y, selfRot.Z, selfRot.W);
+        if (_avatarStreamer != null && _avatarStreamer.TryGetSelfPose(out _, out var drawnRotation))
+            rotation = drawnRotation;
+        var forward = Vector3.Transform(Vector3.UnitX, rotation);
+        float cameraYaw = MathF.Atan2(forward.Y, forward.X) * (180f / MathF.PI) + 180f;
 
         // ~3.5 m distance, 15° pitch — matches SL's default third-person camera.
         // Reset the tracked heading so FollowAvatar doesn't apply a stale delta
@@ -1263,56 +1262,75 @@ public partial class SceneViewerViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Slides the camera target to the avatar's current position without
-    /// touching the orbit yaw, pitch, or zoom distance.
-    /// Called on every terse/avatar update so the camera tracks movement smoothly.
+    /// Called when a network update for the agent's own avatar arrives. The camera itself is
+    /// moved per frame by <see cref="OnViewportFrame"/>, which follows the pose the avatar is
+    /// drawn with; this only makes sure a frame is produced. Before the avatar has been placed
+    /// there is no drawn pose to follow, so the camera is put on the reported position.
     /// </summary>
     private void FollowAvatar()
     {
         if (_viewport == null) return;
-        var pos = _instance.Client.Self.SimPosition;
-        if (pos.X == 0f && pos.Y == 0f && pos.Z == 0f) return;
-
-        if (MouselookActive)
+        if (_avatarStreamer != null && _avatarStreamer.TryGetSelfPose(out _, out _))
         {
-            // In mouselook the user's mouse drives Yaw/Pitch directly (see
-            // VkViewportControl.OnPointerMoved) — just keep the fixed eye position
-            // tracking the avatar, don't auto-rotate yaw to face heading.
-            var eye = new Vector3(pos.X, pos.Y, pos.Z + 1.0f);
-            Avalonia.Threading.Dispatcher.UIThread.Post(() =>
-            {
-                if (_viewport != null) { _viewport.Camera.MouselookEye = eye; _viewport.RequestRender(); }
-            });
+            _viewport.RequestRender();
             return;
         }
 
-        // Compute the avatar's current heading in degrees.
+        var pos = _instance.Client.Self.SimPosition;
+        if (pos.X == 0f && pos.Y == 0f && pos.Z == 0f) return;
         var rot = _instance.Client.Self.SimRotation;
-        float headingRad = MathF.Atan2(
-            2f * (rot.W * rot.Z + rot.X * rot.Y),
-            1f - 2f * (rot.Y * rot.Y + rot.Z * rot.Z));
-        float headingDeg = headingRad * (180f / MathF.PI);
-
-        // Compute the heading delta and rotate the camera yaw to stay behind the avatar.
-        if (!float.IsNaN(_lastKnownHeadingDeg))
+        var position = new Vector3(pos.X, pos.Y, pos.Z);
+        var rotation = new System.Numerics.Quaternion(rot.X, rot.Y, rot.Z, rot.W);
+        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
         {
-            float delta = headingDeg - _lastKnownHeadingDeg;
-            // Normalise to [-180, +180] to avoid wrap-around jumps.
-            while (delta >  180f) delta -= 360f;
-            while (delta < -180f) delta += 360f;
-            if (MathF.Abs(delta) > 0.05f)
-            {
-                Avalonia.Threading.Dispatcher.UIThread.Post(() =>
-                {
-                    _viewport?.Camera.OrbitStep(delta, 0f);
-                });
-            }
-        }
-        _lastKnownHeadingDeg = headingDeg;
+            ApplyCameraFollow(position, rotation);
+            _viewport?.RequestRender();
+        });
+    }
 
-        // Use the same eye-level offset as CenterCameraOnAvatar so the camera
-        // target stays at head height, not at the avatar's feet.
-        _viewport.UpdateCameraFollow(new Vector3(pos.X, pos.Y, pos.Z + 1.0f));
+    /// <summary>Per-frame camera follow; runs on the UI thread at the start of each frame.</summary>
+    private void OnViewportFrame()
+    {
+        if (_disposed || _avatarStreamer == null) return;
+        if (_avatarStreamer.TryGetSelfPose(out var position, out var rotation))
+            ApplyCameraFollow(position, rotation);
+    }
+
+    /// <summary>
+    /// Keeps the camera on the avatar: slides the orbit target to head height and turns the
+    /// orbit yaw by however much the avatar's heading changed, preserving the user's own orbit
+    /// angle and zoom. In mouselook only the eye position follows.
+    /// </summary>
+    private void ApplyCameraFollow(Vector3 position, System.Numerics.Quaternion rotation)
+    {
+        if (_viewport == null) return;
+        var camera = _viewport.Camera;
+        var eyeLevel = new Vector3(position.X, position.Y, position.Z + 1.0f);
+
+        if (MouselookActive)
+        {
+            camera.MouselookEye = eyeLevel;
+            return;
+        }
+
+        // Heading is the direction the avatar's forward (+X) axis points on the ground plane.
+        // When that axis is close to vertical (a tilted seat, a vehicle) there is no meaningful
+        // heading, so the previous one is kept instead of letting the camera swing round.
+        var forward = Vector3.Transform(Vector3.UnitX, rotation);
+        if (forward.X * forward.X + forward.Y * forward.Y > 0.04f)
+        {
+            float headingDeg = MathF.Atan2(forward.Y, forward.X) * (180f / MathF.PI);
+            if (!float.IsNaN(_lastKnownHeadingDeg))
+            {
+                float delta = headingDeg - _lastKnownHeadingDeg;
+                while (delta >  180f) delta -= 360f;
+                while (delta < -180f) delta += 360f;
+                if (delta != 0f) camera.OrbitStep(delta, 0f);
+            }
+            _lastKnownHeadingDeg = headingDeg;
+        }
+
+        camera.Target = eyeLevel;
     }
 
     [RelayCommand]
@@ -1587,11 +1605,9 @@ public partial class SceneViewerViewModel : ObservableObject, IDisposable
 
             const float TurnDelta = 0.1f; // seconds per tick
             if (turnLeft)
-                mv.BodyRotation *= LibreMetaverse.Quaternion.CreateFromAxisAngle(
-                    LibreMetaverse.Vector3.UnitZ, TurnDelta);
+                Radegast.AvatarFacing.Yaw(mv, TurnDelta);
             else if (turnRight)
-                mv.BodyRotation *= LibreMetaverse.Quaternion.CreateFromAxisAngle(
-                    LibreMetaverse.Vector3.UnitZ, -TurnDelta);
+                Radegast.AvatarFacing.Yaw(mv, -TurnDelta);
         }
 
         mv.SendUpdate();
@@ -1665,7 +1681,9 @@ public partial class SceneViewerViewModel : ObservableObject, IDisposable
             _viewport.SceneReset       -= OnSceneReset;
             _viewport.GroundClicked    -= OnGroundClicked;
             _viewport.MouselookChanged -= OnMouselookChanged;
+            _viewport.FrameUpdate      -= OnViewportFrame;
             _viewport.Stats.FrameCompleted -= OnFrameCompleted;
+            _instance.SceneFrameRate = 0f;
         }
 
         if (_nameTagService != null)
@@ -1795,6 +1813,8 @@ public partial class SceneViewerViewModel : ObservableObject, IDisposable
     {
         if (_disposed) return;
 
+        _instance.SceneFrameRate = stats.IntervalAvgMs > 0 ? (float)(1000.0 / stats.IntervalAvgMs) : 0f;
+
         // Snapshot in-flight counters on the calling thread — all reads are O(1) atomic/lock-free.
         int buildQueue   = _buildScheduler?.QueueCount          ?? 0;
         int objBuilds    = _objectStreamer?.InflightCount        ?? 0;
@@ -1830,7 +1850,8 @@ public partial class SceneViewerViewModel : ObservableObject, IDisposable
                    // Frame-interval variance (plan Step 3) -- the metric that actually answers
                    // "is it choppy," since CPU/GPU ms alone can drop once frame-in-flight
                    // pipelining (Step 6) lands whether or not real frame pacing improves.
-                   $"  Interval max:{stats.IntervalMaxMs:F1}ms p99:{stats.IntervalP99Ms:F1}ms" +
+                   $"  Interval max:{stats.IntervalMaxMs:F1}ms p99:{stats.IntervalP99Ms:F1}ms avg:{stats.IntervalAvgMs:F1}ms" +
+                   $" (1x:{stats.IntervalsOneRefresh} 2x:{stats.IntervalsTwoRefreshes} 3x:{stats.IntervalsThreeRefreshes} more:{stats.IntervalsLonger})" +
                    $"\nDraws {stats.DrawCalls}  Tris {stats.Triangles:#,0}" +
                    $"\nFaces {stats.FacesSubmitted}  Culled {stats.FacesCulled}  ObjOccluded {stats.ObjectsOcclusionCulled}" +
                    $"\nBuild Q:{buildQueue}  Obj:{objBuilds}  Av:{avBuilds}" +

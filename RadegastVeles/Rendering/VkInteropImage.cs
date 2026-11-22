@@ -35,6 +35,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using Avalonia;
 using Avalonia.Platform;
+using Microsoft.Extensions.Logging;
 using Silk.NET.Core.Native;
 using Silk.NET.Direct3D11;
 using Silk.NET.DXGI;
@@ -61,6 +62,7 @@ internal sealed unsafe class VkInteropImage : IDisposable
     private DeviceMemory _imageMemory;
     private ComPtr<ID3D11Texture2D> _d3dTexture2D;
 
+    private readonly Dictionary<ulong, Framebuffer> _framebuffers = new();
     internal Image InternalHandle { get; private set; }
     internal Format Format { get; }
     internal ImageAspectFlags AspectFlags { get; }
@@ -100,6 +102,69 @@ internal sealed unsafe class VkInteropImage : IDisposable
             SType = StructureType.ExternalMemoryImageCreateInfo,
             HandleTypes = handleType
         };
+
+        // On Linux, Avalonia displays our Vulkan image through OpenGL. We pass GL a shared-memory
+        // handle (Opaque FD), and GL creates a texture from it as a plain RGBA rectangle.
+        //
+        // OPTIMAL tiling stores pixels in a driver-private order. Avalonia does not pass a DRM
+        // modifier describing that order, so Mesa/RADV cannot match it to a plain rectangle. The
+        // import failed with GL_OUT_OF_MEMORY and lost the GL context; the visible result was
+        // flickering horizontal streaks in the 3D panels.
+        //
+        // LINEAR tiling stores pixels row by row, which both APIs understand. Use it for Linux
+        // OpaqueFD exports when the device supports the features we need; keep OPTIMAL on
+        // Windows/macOS and on devices that do not.
+        var tiling = ImageTiling.Optimal;
+        var imageCreateFlags = ImageCreateFlags.CreateMutableFormatBit;
+        var shouldUseLinearImport = exportable
+                                    && !isMacOS
+                                    && handleType == ExternalMemoryHandleTypeFlags.OpaqueFDBit;
+        if (shouldUseLinearImport)
+        {
+            // Generic format properties can't tell us whether this format/tiling is actually
+            // exportable via this handle type -- query the external-memory-specific variant,
+            // which also validates tiling/usage/flags together instead of just LinearTilingFeatures.
+            var externalFormatInfo = new PhysicalDeviceExternalImageFormatInfo
+            {
+                SType = StructureType.PhysicalDeviceExternalImageFormatInfo,
+                HandleType = handleType
+            };
+            var formatInfo2 = new PhysicalDeviceImageFormatInfo2
+            {
+                SType = StructureType.PhysicalDeviceImageFormatInfo2,
+                PNext = &externalFormatInfo,
+                Format = Format,
+                Type = ImageType.Type2D,
+                Tiling = ImageTiling.Linear,
+                Usage = _imageUsageFlags
+            };
+            var externalFormatProperties = new ExternalImageFormatProperties
+            {
+                SType = StructureType.ExternalImageFormatProperties
+            };
+            var formatProperties2 = new ImageFormatProperties2
+            {
+                SType = StructureType.ImageFormatProperties2,
+                PNext = &externalFormatProperties
+            };
+
+            var result = Api.GetPhysicalDeviceImageFormatProperties2(_physicalDevice, &formatInfo2, &formatProperties2);
+            var linearIsExportable = result == Result.Success &&
+                (externalFormatProperties.ExternalMemoryProperties.ExternalMemoryFeatures & ExternalMemoryFeatureFlags.ExportableBit) != 0;
+
+            if (linearIsExportable)
+            {
+                tiling = ImageTiling.Linear;
+                imageCreateFlags = 0;
+            }
+            else
+            {
+                LibreMetaverse.Logger.Log(
+                    "[VkInterop] Linear tiling is not exportable for this image's format/usage; keeping OPTIMAL tiling",
+                    LogLevel.Warning);
+            }
+        }
+
         // macOS: VK_EXT_metal_objects uses pNext on the image create info instead of
         // ExternalMemoryImageCreateInfo to mark the image for IOSurface export.
         var exportMetalObjectCreateInfo = new ExportMetalObjectCreateInfoEXT
@@ -120,11 +185,11 @@ internal sealed unsafe class VkInteropImage : IDisposable
             MipLevels = MipLevels,
             ArrayLayers = 1,
             Samples = SampleCountFlags.Count1Bit,
-            Tiling = ImageTiling.Optimal,
+            Tiling = tiling,
             Usage = _imageUsageFlags,
             SharingMode = SharingMode.Exclusive,
             InitialLayout = ImageLayout.Undefined,
-            Flags = ImageCreateFlags.CreateMutableFormatBit
+            Flags = imageCreateFlags
         };
 
         Api.CreateImage(_device, in imageCreateInfo, null, out var image).ThrowOnError();
@@ -303,8 +368,32 @@ internal sealed unsafe class VkInteropImage : IDisposable
         commandBuffer.SubmitAndWait();
     }
 
+    /// <summary>Returns a framebuffer attaching only this image's view, compatible with
+    /// <paramref name="renderPass"/>, creating it on first use. Lives as long as the image.</summary>
+    public Framebuffer GetFramebuffer(RenderPass renderPass)
+    {
+        if (_framebuffers.TryGetValue(renderPass.Handle, out var framebuffer)) return framebuffer;
+
+        var view = _imageView;
+        var info = new FramebufferCreateInfo
+        {
+            SType = StructureType.FramebufferCreateInfo,
+            RenderPass = renderPass,
+            AttachmentCount = 1,
+            PAttachments = &view,
+            Width = (uint)Size.Width,
+            Height = (uint)Size.Height,
+            Layers = 1
+        };
+        Api.CreateFramebuffer(_device, in info, null, out framebuffer).ThrowOnError();
+        _framebuffers[renderPass.Handle] = framebuffer;
+        return framebuffer;
+    }
+
     public void Dispose()
     {
+        foreach (var framebuffer in _framebuffers.Values) Api.DestroyFramebuffer(_device, framebuffer, null);
+        _framebuffers.Clear();
         Api.DestroyImageView(_device, _imageView, null);
         Api.DestroyImage(_device, InternalHandle, null);
         if (_imageMemory.Handle != 0) Api.FreeMemory(_device, _imageMemory, null);

@@ -28,7 +28,7 @@ using Vector3 = System.Numerics.Vector3;
 namespace Radegast.Veles.Rendering;
 
 /// <summary>
-/// Drives every scene-viewer <see cref="FlexiPrimAnimator"/> from one shared ~30 Hz timer
+/// Drives every scene-viewer <see cref="FlexiPrimAnimator"/> from one shared loop that runs once per rendered frame
 /// instead of each animator owning its own <see cref="PeriodicTimer"/> and background
 /// <see cref="Task"/>. A busy sim can easily have dozens of flexi objects (grass, trees,
 /// flexi attachments on nearby avatars) — one timer/task per object is unnecessary
@@ -36,7 +36,7 @@ namespace Radegast.Veles.Rendering;
 /// <para>
 /// Also applies distance-based tick throttling: flexi prims far from the camera get
 /// simulated at a fraction of the base rate (see <see cref="TickDivisor"/>) rather than
-/// spending full 30 Hz spine-physics + vertex-deform cost on something a few pixels wide
+/// spending full-rate spine-physics + vertex-deform cost on something a few pixels wide
 /// or off to the side. Distance uses <see cref="FlexiPrimAnimator.ApproximateWorldPosition"/>,
 /// which is cheap (no extra lookups) but coarse — fine for LOD bucketing, not for anything
 /// requiring precision.
@@ -44,7 +44,11 @@ namespace Radegast.Veles.Rendering;
 /// </summary>
 internal sealed class FlexiSceneScheduler : IDisposable
 {
-    private const float SimTickRate = 1f / 30f;
+    // Animators tick once per rendered frame, so a shape never repeats or skips a frame. This
+    // is the interval used while no frames are being rendered.
+    private const int IdleTickMs = 50;
+    private readonly FramePulse _pulse;
+    private const float MaxStepSeconds = 0.2f;
 
     private readonly GridClient _client;
     // Animator → consecutive skipped ticks since its last real Tick() call.
@@ -52,8 +56,13 @@ internal sealed class FlexiSceneScheduler : IDisposable
 
     private CancellationTokenSource? _cts;
     private bool _disposed;
+    private bool _loggedTickError;
 
-    public FlexiSceneScheduler(GridClient client) => _client = client;
+    public FlexiSceneScheduler(GridClient client, ISceneViewport viewport)
+    {
+        _client = client;
+        _pulse  = new FramePulse(viewport);
+    }
 
     public void Register(FlexiPrimAnimator animator) => _registered[animator] = 0;
 
@@ -72,6 +81,7 @@ internal sealed class FlexiSceneScheduler : IDisposable
         _cts?.Cancel();
         _cts?.Dispose();
         _cts = null;
+        _pulse.Dispose();
         _registered.Clear();
     }
 
@@ -79,34 +89,29 @@ internal sealed class FlexiSceneScheduler : IDisposable
     //
     // Mirrors the spirit of SceneAvatarStreamer.AvatarLodForDistance: things far from
     // the camera don't need full-rate simulation. A flexi prim that's simulated at
-    // 7.5 Hz instead of 30 Hz looks identical at 48+ metres, but costs a quarter as much
+    // 7.5 Hz instead of 60 Hz looks identical at 48+ metres, but costs an eighth as much
     // CPU (or GPU dispatch) time.
     private static int TickDivisor(float distance) => distance switch
     {
-        < 16f => 1,  // full 30 Hz
-        < 32f => 2,  // ~15 Hz
-        < 64f => 4,  // ~7.5 Hz
-        _     => 8,  // ~3.75 Hz — still alive (no visible freeze/pop), close to free
+        < 16f => 1,  // 60 Hz
+        < 32f => 4,  // 15 Hz
+        < 64f => 8,  // 7.5 Hz
+        _     => 16, // 3.75 Hz
     };
 
     private async Task RunAsync(CancellationToken ct)
     {
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(SimTickRate));
         var sw   = Stopwatch.StartNew();
         float prev = 0f;
 
         try
         {
-            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            while (true)
             {
+                await _pulse.WaitAsync(IdleTickMs, ct).ConfigureAwait(false);
                 float now = (float)sw.Elapsed.TotalSeconds;
                 float dt  = Math.Min(now - prev, 0.1f);
                 prev = now;
-
-                // FlexiPrimAnimator.Tick() itself also gates on AnimationEnabled, but
-                // skipping the whole distance-lookup pass here when animation is off
-                // avoids paying for it every tick for no reason.
-                if (!FlexiPrimAnimator.AnimationEnabled) continue;
 
                 var self = _client.Self.SimPosition;
                 var selfPos = new Vector3(self.X, self.Y, self.Z);
@@ -135,9 +140,22 @@ internal sealed class FlexiSceneScheduler : IDisposable
                         // Catch-up dt: the physics forces (gravity/wind/tension impulses) are
                         // scaled by dt, so a throttled animator needs the elapsed time since its
                         // last real tick, not just this cycle's slice, or it would settle into a
-                        // visibly stiffer rest pose than an un-throttled one. Still clamped to
-                        // the same 0.1s stability bound TickAndUpload's own per-cycle dt uses.
-                        animator.Tick(Math.Min(dt * skipped, 0.1f));
+                        // visibly stiffer rest pose than an un-throttled one. Clamped to the
+                        // 0.2s step limit the SL viewer's flexi simulation uses.
+                        try
+                        {
+                            animator.Tick(Math.Min(dt * skipped, MaxStepSeconds));
+                        }
+                        catch (Exception ex) when (ex is not OperationCanceledException)
+                        {
+                            // One animator throwing must not end the loop for every flexi
+                            // object in the scene.
+                            if (!_loggedTickError)
+                            {
+                                _loggedTickError = true;
+                                Logger.Error("FlexiSceneScheduler: a flexi animator's Tick threw", ex);
+                            }
+                        }
                         _registered[animator] = 0;
                     }
                     else
